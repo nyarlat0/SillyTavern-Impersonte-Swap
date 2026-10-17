@@ -53,7 +53,7 @@ async function fixture(api = 'openai') {
         makeLast(key, fn) { this.on(key, fn); },
     };
     const event_types = Object.fromEntries(['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS', 'GENERATE_AFTER_DATA',
-        'CHAT_COMPLETION_PROMPT_READY', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED'].map(x => [x, x]));
+        'CHAT_COMPLETION_PROMPT_READY', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED', 'WORLDINFO_ENTRIES_LOADED'].map(x => [x, x]));
     const power_user = {
         sysprompt: { content: 'You are {{char}}, talk to {{user}}', post_history: '{{char}}' },
         context: { story_string: '{{char}}: {{description}} {{user}}: {{persona}}', chat_start: '{{char}}', example_separator: '###' },
@@ -62,12 +62,15 @@ async function fixture(api = 'openai') {
     const characters = [{ data: { system_prompt: '{{char}} override', description: '{{char}} description' } }];
     const chat_metadata = { system_prompt: '{{char}} chat override' };
     const extension_settings = {};
+    const extension_prompts = {};
+    const groups = [];
     const promptManager = { preparePrompt: prompt => ({ ...prompt }) };
     const context = vm.createContext({ console, window: { addEventListener() {} }, jQuery() {} });
     const dependencies = {
-        '../../../../script.js': { eventSource, event_types, characters, chat_metadata, this_chid: 0, main_api: api, saveSettingsDebounced() {} },
+        '../../../../script.js': { eventSource, event_types, characters, chat_metadata, extension_prompts, this_chid: 0, main_api: api, saveSettingsDebounced() {} },
         '../../../extensions.js': { extension_settings },
         '../../../power-user.js': { power_user },
+        '../../../group-chats.js': { groups, selected_group: 'group' },
         '../../../openai.js': { promptManager },
         './core.mjs': { defaults, swapMacros, swapHistory, PromptTransaction },
     };
@@ -84,7 +87,7 @@ async function fixture(api = 'openai') {
         await emit('GENERATION_STARTED', type, {}, dry);
         await emit('GENERATION_AFTER_COMMANDS', type, {}, dry);
     };
-    return { power_user, characters, chat_metadata, extension_settings, promptManager, context, emit, start };
+    return { power_user, characters, chat_metadata, extension_prompts, groups, extension_settings, promptManager, context, emit, start };
 }
 
 test('Chat Completion changes main prompt and history, excludes other prompt blocks, cleans up', async () => {
@@ -147,4 +150,116 @@ test('all three checkboxes act independently', async () => {
         assert.equal(f.power_user.instruct.last_input_sequence === '<assistant>', selected === 'history');
         await f.emit('GENERATION_ENDED');
     }
+});
+
+function populateSources(f) {
+    Object.assign(f.characters[0], {
+        avatar: 'alice.png', description: '{{char}} description', personality: '{{user}} personality',
+        mes_example: '{{char}}: example', scenario: '{{user}} scenario', first_mes: '{{char}} greeting',
+    });
+    Object.assign(f.characters[0].data, {
+        description: '{{char}} description', personality: '{{user}} personality',
+        mes_example: '{{char}}: example', scenario: '{{user}} scenario',
+        extensions: { depth_prompt: { prompt: '{{char}} depth' } },
+        post_history_instructions: '{{char}} PHI',
+    });
+    Object.assign(f.chat_metadata, { mes_example: '{{user}} example override', scenario: '{{char}} scenario override' });
+    f.power_user.persona_description = '{{user}} persona';
+}
+
+test('new scopes default off for existing installations', async () => {
+    const f = await fixture();
+    populateSources(f);
+    await f.start();
+    assert.equal(f.characters[0].description, '{{char}} description');
+    assert.equal(f.power_user.persona_description, '{{user}} persona');
+    assert.equal(f.chat_metadata.scenario, '{{char}} scenario override');
+    const sources = { globalLore: [{ content: '{{char}} lore' }] };
+    await f.emit('WORLDINFO_ENTRIES_LOADED', sources);
+    assert.equal(sources.globalLore[0].content, '{{char}} lore');
+    f.extension_prompts['2_floating_prompt'] = { value: '{{user}} note' };
+    assert.equal(f.extension_prompts['2_floating_prompt'].value, '{{user}} note');
+    await f.emit('GENERATION_ENDED');
+});
+
+test('card, persona and scenario are independent on both APIs and restore saved sources', async () => {
+    for (const api of ['openai', 'textgenerationwebui']) {
+        for (const selected of ['character', 'persona', 'scenario']) {
+            const f = await fixture(api);
+            populateSources(f);
+            f.extension_settings.impersonate_swap = { system: false, context: false, [selected]: true };
+            const snapshot = JSON.stringify([f.characters, f.power_user, f.chat_metadata]);
+            await f.start();
+            assert.equal(f.characters[0].description, selected === 'character' ? '{{user}} description' : '{{char}} description');
+            assert.equal(f.characters[0].data.extensions.depth_prompt.prompt, selected === 'character' ? '{{user}} depth' : '{{char}} depth');
+            assert.equal(f.chat_metadata.mes_example, selected === 'character' ? '{{char}} example override' : '{{user}} example override');
+            assert.equal(f.power_user.persona_description, selected === 'persona' ? '{{char}} persona' : '{{user}} persona');
+            assert.equal(f.chat_metadata.scenario, selected === 'scenario' ? '{{user}} scenario override' : '{{char}} scenario override');
+            assert.equal(f.characters[0].scenario, selected === 'scenario' ? '{{char}} scenario' : '{{user}} scenario');
+            assert.equal(f.characters[0].first_mes, '{{char}} greeting');
+            assert.equal(f.characters[0].data.post_history_instructions, '{{char}} PHI');
+            assert.equal(JSON.stringify([f.characters, f.power_user, f.chat_metadata]), snapshot);
+            await f.emit('GENERATE_AFTER_DATA');
+            assert.equal(JSON.stringify([f.characters, f.power_user, f.chat_metadata]), snapshot);
+            assert.equal(f.characters[0].description, '{{char}} description');
+        }
+    }
+});
+
+test('lore swaps content for all book sources without changing keys or source records', async () => {
+    const f = await fixture();
+    f.extension_settings.impersonate_swap = { lore: true };
+    await f.start();
+    const original = { content: '{{char}} knows {{user}}', key: ['{{char}}'], keysecondary: ['{{user}}'], position: 4 };
+    const sources = Object.fromEntries(['globalLore', 'characterLore', 'chatLore', 'personaLore'].map(key => [key, [original]]));
+    await f.emit('WORLDINFO_ENTRIES_LOADED', sources);
+    for (const entries of Object.values(sources)) {
+        assert.equal(entries[0].content, '{{user}} knows {{char}}');
+        assert.equal(entries[0].key[0], '{{char}}');
+        assert.equal(entries[0].keysecondary[0], '{{user}}');
+        assert.equal(entries[0].position, 4);
+    }
+    assert.equal(original.content, '{{char}} knows {{user}}');
+    await f.emit('GENERATION_STOPPED');
+    const normal = { globalLore: [original] };
+    await f.emit('WORLDINFO_ENTRIES_LOADED', normal);
+    assert.equal(normal.globalLore[0], original);
+});
+
+test('note swap happens before WI/persona insertion and never swaps the combined note again', async () => {
+    const f = await fixture();
+    f.extension_settings.impersonate_swap = { authorsNote: true, persona: true };
+    f.power_user.persona_description = '{{user}} persona';
+    const original = { value: 'previous note' };
+    f.extension_prompts['2_floating_prompt'] = original;
+    await f.start();
+    // setFloatingPrompt combines the textarea and character-specific note.
+    f.extension_prompts['2_floating_prompt'] = { value: '{{char}} chat note\n{{user}} character note', depth: 4 };
+    assert.equal(f.extension_prompts['2_floating_prompt'].value, '{{user}} chat note\n{{char}} character note');
+    // WI and persona are appended later by ST, under their own independent switches.
+    f.extension_prompts['2_floating_prompt'] = {
+        ...f.extension_prompts['2_floating_prompt'],
+        value: f.extension_prompts['2_floating_prompt'].value + '\n{{char}} lore\n' + f.power_user.persona_description,
+    };
+    assert.equal(f.extension_prompts['2_floating_prompt'].value,
+        '{{user}} chat note\n{{char}} character note\n{{char}} lore\n{{char}} persona');
+    await f.emit('GENERATION_STOPPED');
+    assert.equal(f.extension_prompts['2_floating_prompt'], original);
+    assert.equal(f.power_user.persona_description, '{{user}} persona');
+    await f.start('normal');
+    f.extension_prompts['2_floating_prompt'] = { value: '{{char}} normal note' };
+    assert.equal(f.extension_prompts['2_floating_prompt'].value, '{{char}} normal note');
+});
+
+test('group card scopes include members but exclude unrelated characters', async () => {
+    const f = await fixture();
+    populateSources(f);
+    f.characters.push({ avatar: 'bob.png', description: '{{char}} Bob' }, { avatar: 'other.png', description: '{{char}} Other' });
+    f.groups.push({ id: 'group', members: ['alice.png', 'bob.png'] });
+    f.extension_settings.impersonate_swap = { character: true };
+    await f.start();
+    assert.equal(f.characters[1].description, '{{user}} Bob');
+    assert.equal(f.characters[2].description, '{{char}} Other');
+    await f.emit('GENERATION_ENDED');
+    assert.equal(f.characters[1].description, '{{char}} Bob');
 });

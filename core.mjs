@@ -1,4 +1,5 @@
-export const defaults = Object.freeze({ enabled: true, history: true, system: true, context: true });
+export const defaults = Object.freeze({ enabled: true, history: true, system: true, context: true,
+    character: false, persona: false, scenario: false, lore: false, authorsNote: false });
 
 // One pass: replacements must not replace each other. Names and other macros are untouched.
 export function swapMacros(text) {
@@ -48,6 +49,27 @@ export class PromptTransaction {
                 if (jsonDescriptor) Object.defineProperty(object, 'toJSON', jsonDescriptor);
                 else delete object.toJSON;
             }
+        });
+    }
+
+    // Author's Note is composed from the textarea and per-character note by ST.
+    // Transform its first assignment only, before WI/persona append their own content.
+    transformNextAssignment(object, key, transform) {
+        const descriptor = Object.getOwnPropertyDescriptor(object, key);
+        let current = object[key];
+        let pending = true;
+        const get = () => current;
+        Object.defineProperty(object, key, {
+            configurable: true, enumerable: true, get,
+            set(value) {
+                current = pending ? transform(value) : value;
+                pending = false;
+            },
+        });
+        this.#undo.push(() => {
+            if (Object.getOwnPropertyDescriptor(object, key)?.get !== get) return;
+            if (descriptor) Object.defineProperty(object, key, descriptor);
+            else delete object[key];
         });
     }
 

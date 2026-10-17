@@ -1,6 +1,7 @@
-import { eventSource, event_types, saveSettingsDebounced, characters, this_chid, chat_metadata, main_api } from '../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced, characters, this_chid, chat_metadata, main_api, extension_prompts } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
+import { groups, selected_group } from '../../../group-chats.js';
 import { promptManager } from '../../../openai.js';
 import { defaults, swapMacros, swapHistory, PromptTransaction } from './core.mjs';
 
@@ -34,6 +35,46 @@ function wrapPromptManager() {
     wrappedManagers.add(promptManager);
 }
 
+function swapFields(object, fields) {
+    if (object) transaction.patch(object, Object.fromEntries(fields.map(key => [key, swapMacros(object[key])])));
+}
+
+function swapAdditionalSources(config) {
+    const group = groups.find(item => item.id === selected_group);
+    const cards = group ? characters.filter(card => group.members.includes(card.avatar)) : [characters[this_chid]];
+    for (const card of cards.filter(Boolean)) {
+        if (config.character) {
+            swapFields(card, ['description', 'personality', 'mes_example']);
+            swapFields(card.data, ['description', 'personality', 'mes_example']);
+            swapFields(card.data?.extensions?.depth_prompt, ['prompt']);
+        }
+        if (config.scenario) {
+            swapFields(card, ['scenario']);
+            swapFields(card.data, ['scenario']);
+        }
+    }
+    if (config.character) swapFields(chat_metadata, ['mes_example']);
+    if (config.scenario) swapFields(chat_metadata, ['scenario']);
+    if (config.persona) swapFields(power_user, ['persona_description']);
+    if (config.authorsNote) {
+        transaction.transformNextAssignment(extension_prompts, '2_floating_prompt', prompt => ({
+            ...prompt, value: swapMacros(prompt.value),
+        }));
+    }
+}
+
+function swapLoreSources(sources) {
+    if (!active?.lore) return;
+    for (const key of ['globalLore', 'characterLore', 'chatLore', 'personaLore']) {
+        const entries = sources[key];
+        if (!Array.isArray(entries)) continue;
+        // These arrays are request-local. Replace entries instead of touching cached books.
+        for (let i = 0; i < entries.length; i++) {
+            entries[i] = { ...entries[i], content: swapMacros(entries[i].content) };
+        }
+    }
+}
+
 function start(type, _options, dryRun) {
     restore();
     const config = settings();
@@ -43,6 +84,7 @@ function start(type, _options, dryRun) {
     transaction = new PromptTransaction();
     try {
         wrapPromptManager();
+        swapAdditionalSources(config);
         if (config.system) {
             transaction.patch(power_user.sysprompt, { content: swapMacros(power_user.sysprompt.content) });
             const data = characters[this_chid]?.data;
@@ -75,6 +117,7 @@ globalThis.impersonateSwapInterceptor = (chat, _contextSize, _abort, type) => {
 // Restore before every new generation, including aborted slash commands and dry runs.
 eventSource.makeFirst(event_types.GENERATION_STARTED, restore);
 eventSource.on(event_types.GENERATION_AFTER_COMMANDS, start);
+eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, swapLoreSources);
 // Text Completion has finished formatting/tokenizing; CC has finished preparing all prompts.
 eventSource.makeLast(event_types.GENERATE_AFTER_DATA, restore);
 eventSource.makeLast(event_types.CHAT_COMPLETION_PROMPT_READY, restore);
@@ -95,7 +138,7 @@ jQuery(() => {
         <div class="inline-drawer-content">
             <p>Обмен ролями только при Impersonate. Результат остаётся в поле ввода.</p>
             <div class="impersonate-swap-options"></div>
-            <small>Context template используется только в Text Completion. Макросы в сообщениях, описаниях, World Info и примерах не меняются.</small>
+            <small>Context template используется только в Text Completion. Новые области замены выключены по умолчанию. Тексты сообщений и буквальные имена не меняются.</small>
         </div>
     </div>`;
     const labels = {
@@ -103,6 +146,11 @@ jQuery(() => {
         history: 'Менять user ↔ assistant в истории',
         system: 'Менять {{char}} ↔ {{user}} в System Prompt',
         context: 'Менять {{char}} ↔ {{user}} в Context Template',
+        character: 'Менять {{char}} ↔ {{user}} в карточке (описание, личность, примеры, depth prompt)',
+        persona: 'Менять {{char}} ↔ {{user}} в описании персоны',
+        scenario: 'Менять {{char}} ↔ {{user}} в сценарии',
+        lore: 'Менять {{char}} ↔ {{user}} в лоре / World Info',
+        authorsNote: 'Менять {{char}} ↔ {{user}} в Author’s Note',
     };
     for (const [key, text] of Object.entries(labels)) {
         const label = document.createElement('label');
