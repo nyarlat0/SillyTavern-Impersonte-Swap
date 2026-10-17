@@ -113,3 +113,7 @@ node --check core.mjs
 ```
 
 Tests cover role and macro swapping, independent source switches, group cards, lore sources, Author's Note composition, restoration, and serialization of original settings during prompt construction. The VM modules flag may produce an experimental-feature warning.
+
+## License
+
+This project is released under [The Unlicense](LICENSE).
