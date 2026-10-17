@@ -1,5 +1,49 @@
 export const defaults = Object.freeze({ enabled: true, history: true, system: true, context: true, contextDescriptions: true,
-    character: false, persona: false, scenario: false, lore: false, authorsNote: false });
+    character: false, persona: false, scenario: false, lore: false, authorsNote: false,
+    endContextEnabled: false, endContextPrompt: '', systemOverwriteEnabled: false, systemOverwritePrompt: '' });
+
+export function joinPromptText(before, after) {
+    return before ? `${before}\n\n${after}` : after;
+}
+
+export function appendSystemMessage(chat, text) {
+    if (!text.trim()) return;
+    const last = chat.at(-1);
+    if (last?.role !== 'system') {
+        chat.push({ role: 'system', content: text });
+    } else if (Array.isArray(last.content)) {
+        // Preserve multimodal content and metadata; do not stringify image/audio parts.
+        last.content = [...last.content, { type: 'text', text: `\n\n${text}` }];
+    } else {
+        last.content = joinPromptText(last.content ?? '', text);
+    }
+}
+
+/** Insert before the generation cue, merging a final formatted system injection. */
+export function appendTextSystemMessage(items, text, cue, formatSystem, canMergeSystem) {
+    if (!text.trim()) return;
+    const last = items.at(-1);
+    if (!last) {
+        items.push({ message: formatSystem(text) + cue, extensionPrompts: [] });
+        return;
+    }
+    const cueIndex = cue ? last.message.lastIndexOf(cue) : last.message.length;
+    if (cueIndex < 0) throw new Error('Impersonate Swap: cannot locate the final response cue');
+    const body = last.message.slice(0, cueIndex);
+    const tail = last.message.slice(cueIndex);
+    const marker = '__IMPERSONATE_SWAP_SYSTEM_CONTENT__';
+    // ST strips a final newline from the last history item before adding the response cue.
+    const formatted = formatSystem(marker).replace(/\n?$/, '');
+    const [prefix, suffix] = formatted.split(marker);
+    if (canMergeSystem(last, body) && body.startsWith(prefix) && body.endsWith(suffix)) {
+        const contentEnd = suffix ? body.length - suffix.length : body.length;
+        const content = body.slice(prefix.length, contentEnd);
+        last.message = prefix + joinPromptText(content, text) + suffix + tail;
+    } else {
+        const separator = body && !body.endsWith('\n') ? '\n' : '';
+        last.message = body + separator + formatSystem(text).replace(/\n?$/, '') + tail;
+    }
+}
 
 // One pass: replacements must not replace each other. Names and other macros are untouched.
 export function swapMacros(text) {

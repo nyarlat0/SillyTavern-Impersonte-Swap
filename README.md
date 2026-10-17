@@ -78,6 +78,39 @@ The five optional source switches default to **Off**, including when upgrading a
 
 The card switch does not change greetings, alternate greetings, creator notes, or Post-History Instructions. System prompts have their own switch. Other custom Prompt Manager blocks and extensions' prompts are outside these switches.
 
+## Custom impersonation prompts
+
+Both fields have their own enable checkbox. They start empty and **Off**. Turning a field off dims and disables its editor without deleting the saved text; disabling Impersonate Swap also dims both editors. Changes apply to the next generation. An empty or whitespace-only field has no effect, even when enabled.
+
+### System Prompt Overwrite
+
+Replaces the main system instruction for Impersonate, taking priority over the preset and character/chat system-prompt overrides. In Chat Completion it replaces Main Prompt and uses the `system` role. In Text Completion it temporarily enables the System Prompt and bypasses the character-prompt preference; the Context Template must include `{{system}}` to render it.
+
+This does not replace the entire context: descriptions, history, Author's Note, Post-History Instructions, and other prompt blocks remain separate.
+
+Example:
+
+```text
+Write the next reply as {{user}}. Use their established voice and knowledge.
+Respond to {{char}} without writing dialogue or actions for them.
+```
+
+### End-Context System Prompt
+
+Adds a final system instruction after the assembled context. If the last Chat Completion message is already `system`, the text is appended to that message after a blank line; otherwise a new `system` message is added. This includes a final system Author's Note.
+
+For Text Completion, it is inserted before the final response cue using the Instruct template's system format, and appended to a final system injection when its formatting matches. A plain-text template has no API roles, so it uses SillyTavern's plain narrator format.
+
+Example:
+
+```text
+Write only {{user}}'s next message. Do not include a speaker label or explain your answer.
+```
+
+These fields are written specifically for impersonation. Standard SillyTavern macros are expanded, but the automatic `{{char}}` / `{{user}}` swap is **not** applied to their text. The two fields work independently and affect only Impersonate.
+
+The end-context prompt is inserted after SillyTavern selects history to fit its token budget. Leave space in the context budget for this text, especially for long instructions; the extension does not retrim history after appending it.
+
 ## Compatibility and limitations
 
 - **Chat Completion:** swaps API roles and suppresses SillyTavern's standard Impersonate instruction when history swapping is enabled.

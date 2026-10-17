@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
-import { defaults, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from '../core.mjs';
+import { defaults, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from '../core.mjs';
 
 test('swap only the two exact macros in one pass', () => {
     assert.equal(swapMacros('{{char}} {{USER}} {{ user }} {{persona}} Alice char {{character}}'),
@@ -45,7 +45,7 @@ test('temporary templates serialize as originals and restore without losing user
     assert.equal(object.content, 'user edit');
 });
 
-async function fixture(api = 'openai') {
+async function fixture(api = 'openai', document = undefined) {
     const listeners = new Map();
     const eventSource = {
         on(key, fn) { const items = listeners.get(key) ?? []; items.push(fn); listeners.set(key, items); },
@@ -53,7 +53,7 @@ async function fixture(api = 'openai') {
         makeLast(key, fn) { this.on(key, fn); },
     };
     const event_types = Object.fromEntries(['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS', 'GENERATE_AFTER_DATA',
-        'CHAT_COMPLETION_PROMPT_READY', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED', 'WORLDINFO_ENTRIES_LOADED'].map(x => [x, x]));
+        'CHAT_COMPLETION_PROMPT_READY', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED', 'WORLDINFO_ENTRIES_LOADED', 'GENERATE_BEFORE_COMBINE_PROMPTS'].map(x => [x, x]));
     const power_user = {
         sysprompt: { content: 'You are {{char}}, talk to {{user}}', post_history: '{{char}}' },
         context: { story_string: '{{char}}: {{description}} {{user}}: {{persona}}', chat_start: '{{char}}', example_separator: '###' },
@@ -65,14 +65,20 @@ async function fixture(api = 'openai') {
     const extension_prompts = {};
     const groups = [];
     const promptManager = { preparePrompt: prompt => ({ ...prompt }) };
-    const context = vm.createContext({ console, window: { addEventListener() {} }, jQuery() {} });
+    const ready = [];
+    const context = vm.createContext({ console, document, window: { addEventListener() {} }, jQuery(callback) { ready.push(callback); } });
     const dependencies = {
-        '../../../../script.js': { eventSource, event_types, characters, chat_metadata, extension_prompts, this_chid: 0, main_api: api, saveSettingsDebounced() {} },
+        '../../../../script.js': { eventSource, event_types, characters, chat_metadata, extension_prompts, this_chid: 0, main_api: api, name1: 'Alice', name2: 'Bob',
+            substituteParams: text => text.replaceAll('{{user}}', 'Alice').replaceAll('{{char}}', 'Bob'), saveSettingsDebounced() {} },
         '../../../extensions.js': { extension_settings },
         '../../../power-user.js': { power_user },
         '../../../group-chats.js': { groups, selected_group: 'group' },
+        '../../../instruct-mode.js': {
+            formatInstructModePrompt: () => '\n<assistant>',
+            formatInstructModeChat: (_name, text) => `<system>\n${text}</system>\n`,
+        },
         '../../../openai.js': { promptManager },
-        './core.mjs': { defaults, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction },
+        './core.mjs': { defaults, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction },
     };
     const module = new vm.SourceTextModule(await readFile(new URL('../index.js', import.meta.url), 'utf8'), { context });
     await module.link(specifier => {
@@ -87,7 +93,7 @@ async function fixture(api = 'openai') {
         await emit('GENERATION_STARTED', type, {}, dry);
         await emit('GENERATION_AFTER_COMMANDS', type, {}, dry);
     };
-    return { power_user, characters, chat_metadata, extension_prompts, groups, extension_settings, promptManager, context, emit, start };
+    return { power_user, characters, chat_metadata, extension_prompts, groups, extension_settings, promptManager, context, emit, start, render: () => ready.forEach(callback => callback()) };
 }
 
 test('Chat Completion changes main prompt and history, excludes other prompt blocks, cleans up', async () => {
@@ -308,4 +314,211 @@ test('context description swap does not affect Chat Completion', async () => {
     await f.start();
     assert.deepEqual(f.power_user.context, before);
     await f.emit('CHAT_COMPLETION_PROMPT_READY');
+});
+
+test('end system message appends to an existing system turn, preserving metadata and multimodal parts', () => {
+    const chat = [{ role: 'user', content: 'Hi' }];
+    appendSystemMessage(chat, 'End');
+    assert.deepEqual(chat.at(-1), { role: 'system', content: 'End' });
+    chat.at(-1).name = 'note';
+    appendSystemMessage(chat, 'More');
+    assert.equal(chat.length, 2);
+    assert.equal(chat.at(-1).content, 'End\n\nMore');
+    assert.equal(chat.at(-1).name, 'note');
+    const parts = [{ type: 'text', text: 'Note' }, { type: 'image_url', image_url: { url: 'data:image/png;base64,abc' } }];
+    const multimodal = [{ role: 'system', content: parts }];
+    appendSystemMessage(multimodal, 'End');
+    assert.equal(multimodal.length, 1);
+    assert.equal(multimodal[0].content[1], parts[1]);
+    assert.equal(multimodal[0].content.at(-1).text, '\n\nEnd');
+    assert.equal(parts.length, 2);
+    appendSystemMessage([], '  ');
+});
+
+test('end prompt in Chat Completion is last, expands macros without swapping and is impersonate-only', async () => {
+    for (const finalRole of ['system', 'assistant', 'user']) {
+        const f = await fixture();
+        f.extension_settings.impersonate_swap = { endContextEnabled: true, endContextPrompt: 'Write for {{user}}, address {{char}}.' };
+        await f.start();
+        const event = { chat: [{ role: finalRole, content: 'Previous' }] };
+        await f.emit('CHAT_COMPLETION_PROMPT_READY', event);
+        assert.equal(event.chat.at(-1).role, 'system');
+        assert.equal(event.chat.at(-1).content, (finalRole === 'system' ? 'Previous\n\n' : '') + 'Write for Alice, address Bob.');
+        assert.equal(event.chat.length, finalRole === 'system' ? 1 : 2);
+        await f.start('normal');
+        const normal = { chat: [{ role: 'user', content: 'Hi' }] };
+        await f.emit('CHAT_COMPLETION_PROMPT_READY', normal);
+        assert.equal(normal.chat.length, 1);
+    }
+});
+
+test('new prompts are ignored when disabled, blank, globally disabled, or dry-run', async () => {
+    for (const config of [
+        { endContextPrompt: 'End', systemOverwritePrompt: 'Overwrite' },
+        { endContextEnabled: true, systemOverwriteEnabled: true, endContextPrompt: '   ', systemOverwritePrompt: '\n' },
+        { enabled: false, endContextEnabled: true, systemOverwriteEnabled: true, endContextPrompt: 'End', systemOverwritePrompt: 'Overwrite' },
+    ]) {
+        const f = await fixture();
+        f.extension_settings.impersonate_swap = config;
+        await f.start();
+        assert.notEqual(f.promptManager.preparePrompt({ identifier: 'main', content: 'Original' }).content, 'Overwrite');
+        const event = { chat: [] };
+        await f.emit('CHAT_COMPLETION_PROMPT_READY', event);
+        assert.equal(event.chat.length, 0);
+    }
+    const f = await fixture();
+    f.extension_settings.impersonate_swap = { endContextEnabled: true, endContextPrompt: 'End' };
+    await f.start('impersonate', true);
+    const event = { chat: [], dryRun: true };
+    await f.emit('CHAT_COMPLETION_PROMPT_READY', event);
+    assert.equal(event.chat.length, 0);
+});
+
+test('system overwrite wins over preset and card on CC without applying name swap', async () => {
+    const f = await fixture();
+    f.extension_settings.impersonate_swap = { systemOverwriteEnabled: true, systemOverwritePrompt: 'You are {{user}}.' };
+    await f.start();
+    for (const content of ['Preset prompt', 'Card override']) {
+        const result = f.promptManager.preparePrompt({ identifier: 'main', role: 'user', content });
+        assert.equal(result.content, 'You are {{user}}.');
+        assert.equal(result.role, 'system');
+    }
+    assert.equal(f.promptManager.preparePrompt({ identifier: 'jailbreak', content: 'PHI' }).content, 'PHI');
+    await f.emit('GENERATION_ENDED');
+    assert.equal(f.promptManager.preparePrompt({ identifier: 'main', content: 'Preset prompt' }).content, 'Preset prompt');
+});
+
+test('text system overwrite enables system prompt and bypasses card preference temporarily', async () => {
+    const f = await fixture('textgenerationwebui');
+    f.power_user.prefer_character_prompt = true;
+    f.power_user.sysprompt.enabled = false;
+    const original = structuredClone(f.power_user);
+    f.extension_settings.impersonate_swap = { systemOverwriteEnabled: true, systemOverwritePrompt: 'You are {{user}}.' };
+    await f.start();
+    assert.equal(f.power_user.sysprompt.content, 'You are {{user}}.');
+    assert.equal(f.power_user.sysprompt.enabled, true);
+    assert.equal(f.power_user.prefer_character_prompt, false);
+    assert.deepEqual(JSON.parse(JSON.stringify(f.power_user)), original);
+    await f.emit('GENERATE_AFTER_DATA');
+    assert.deepEqual(f.power_user, original);
+});
+
+test('text end prompt precedes response cue and merges a final system note', async () => {
+    const f = await fixture('textgenerationwebui');
+    f.extension_settings.impersonate_swap = { endContextEnabled: true, endContextPrompt: 'End for {{user}}' };
+    await f.start();
+    const note = { finalMesSend: [{ message: '<system>\nAuthor note</system>\n<assistant>', extensionPrompts: [], injected: true }] };
+    await f.emit('GENERATE_BEFORE_COMBINE_PROMPTS', note);
+    assert.equal(note.finalMesSend[0].message, '<system>\nAuthor note\n\nEnd for Alice</system>\n<assistant>');
+    const ordinary = { finalMesSend: [{ message: '<user>\nHi</user>\n<assistant>', extensionPrompts: [], injected: false }] };
+    await f.emit('GENERATE_BEFORE_COMBINE_PROMPTS', ordinary);
+    assert.equal(ordinary.finalMesSend[0].message, '<user>\nHi</user>\n<system>\nEnd for Alice</system>\n<assistant>');
+    await f.emit('GENERATE_AFTER_DATA');
+});
+
+test('plain text end prompt preserves the user name cue and empty history', () => {
+    const items = [{ message: 'Bob: Hi\nAlice:', extensionPrompts: [] }];
+    appendTextSystemMessage(items, 'End', '\nAlice:', text => `${text}\n`, () => false);
+    assert.equal(items[0].message, 'Bob: Hi\nEnd\nAlice:');
+    const empty = [];
+    appendTextSystemMessage(empty, 'End', '\nAlice:', text => `${text}\n`, () => false);
+    assert.equal(empty[0].message, 'End\n\nAlice:');
+});
+
+test('final Narrator message merges even when it is not an extension injection', async () => {
+    const f = await fixture('textgenerationwebui');
+    f.extension_settings.impersonate_swap = { endContextEnabled: true, endContextPrompt: 'End' };
+    await f.start();
+    f.context.impersonateSwapInterceptor([{ mes: 'Narration', is_user: false, extra: { type: 'narrator' } }], 4096, () => {}, 'impersonate');
+    const data = { finalMesSend: [{ message: '<system>\nNarration</system>\n<assistant>', extensionPrompts: [], injected: false }] };
+    await f.emit('GENERATE_BEFORE_COMBINE_PROMPTS', data);
+    assert.equal(data.finalMesSend[0].message, '<system>\nNarration\n\nEnd</system>\n<assistant>');
+    await f.emit('GENERATE_AFTER_DATA');
+});
+
+test('end prompt works with the installed ST Instruct formatter, including wrapping and name cues', async t => {
+    let source;
+    try {
+        source = await readFile(new URL('../../../../instruct-mode.js', import.meta.url), 'utf8');
+    } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        t.skip('Optional check requires installation inside SillyTavern');
+        return;
+    }
+    function extract(name) {
+        const start = source.indexOf(`export function ${name}(`);
+        assert.ok(start >= 0);
+        return source.slice(start, source.indexOf('\n/**', start)).replace('export function', 'function');
+    }
+    for (const wrap of [false, true]) {
+        for (const names of [0, 1]) {
+            for (const suffix of ['\n', '</turn>']) {
+                const settings = {
+                    wrap, names_behavior: names, input_sequence: '<user>', output_sequence: '<assistant>',
+                    last_input_sequence: '<assistant>', system_sequence: '<system>', system_suffix: suffix,
+                    input_suffix: suffix, output_suffix: suffix, macro: false,
+                };
+                const context = vm.createContext({
+                    structuredClone, power_user: { instruct: settings }, selected_group: null,
+                    names_behavior_types: { ALWAYS: 1, FORCE: 2 }, force_output_sequence: { FIRST: 1, LAST: 2 },
+                });
+                vm.runInContext(extract('formatInstructModeChat') + '\n' + extract('formatInstructModePrompt'), context);
+                const format = text => context.formatInstructModeChat('', text, false, true, '', 'Alice', 'Bob', false);
+                const cue = context.formatInstructModePrompt('Alice', true, '', 'Alice', 'Bob', false, false);
+                const body = format('Note').replace(/\n?$/, '');
+                const items = [{ message: body + cue, extensionPrompts: [], injected: true }];
+                appendTextSystemMessage(items, 'End', cue, format, () => true);
+                assert.equal(items[0].message, format('Note\n\nEnd').replace(/\n?$/, '') + cue);
+            }
+        }
+    }
+});
+
+test('prompt editors retain saved text and dim/disable with their own switch or master switch', async () => {
+    class Element {
+        children = [];
+        style = {};
+        listeners = {};
+        queries = {};
+        append(...nodes) { this.children.push(...nodes); }
+        setAttribute() {}
+        addEventListener(event, callback) { this.listeners[event] = callback; }
+        querySelector(selector) { return this.queries[selector] ??= new Element(); }
+    }
+    const root = new Element();
+    const document = { createElement: () => new Element(), createTextNode: text => ({ textContent: text }), getElementById: () => root };
+    const f = await fixture('openai', document);
+    f.extension_settings.impersonate_swap = { systemOverwritePrompt: 'Saved overwrite', endContextPrompt: 'Saved end' };
+    f.render();
+    const panel = root.children[0];
+    const sections = panel.querySelector('.inline-drawer-content').children;
+    assert.equal(sections.length, 2);
+    for (const section of sections) {
+        const [label, textarea] = section.children;
+        const toggle = label.children[0];
+        assert.equal(textarea.disabled, true);
+        assert.equal(textarea.style.opacity, '0.45');
+        assert.ok(textarea.value.startsWith('Saved'));
+        toggle.checked = true;
+        toggle.listeners.change();
+        assert.equal(textarea.disabled, false);
+        assert.equal(textarea.style.opacity, '1');
+        textarea.value = 'Edited';
+        textarea.listeners.input();
+        toggle.checked = false;
+        toggle.listeners.change();
+        assert.equal(textarea.value, 'Edited');
+        assert.equal(textarea.disabled, true);
+        toggle.checked = true;
+        toggle.listeners.change();
+    }
+    const master = panel.querySelector('.impersonate-swap-options').children[0].children[0];
+    master.checked = false;
+    master.listeners.change();
+    assert.ok(sections.every(section => section.children[1].disabled));
+    master.checked = true;
+    master.listeners.change();
+    assert.ok(sections.every(section => !section.children[1].disabled));
+    assert.equal(f.extension_settings.impersonate_swap.systemOverwritePrompt, 'Edited');
+    assert.equal(f.extension_settings.impersonate_swap.endContextPrompt, 'Edited');
 });

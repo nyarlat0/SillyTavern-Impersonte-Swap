@@ -1,9 +1,10 @@
-import { eventSource, event_types, saveSettingsDebounced, characters, this_chid, chat_metadata, main_api, extension_prompts } from '../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced, characters, this_chid, chat_metadata, main_api, extension_prompts, substituteParams, name1, name2 } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
 import { groups, selected_group } from '../../../group-chats.js';
+import { formatInstructModeChat, formatInstructModePrompt } from '../../../instruct-mode.js';
 import { promptManager } from '../../../openai.js';
-import { defaults, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from './core.mjs';
+import { defaults, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from './core.mjs';
 
 const KEY = 'impersonate_swap';
 let active = null;
@@ -24,7 +25,10 @@ function wrapPromptManager() {
     if (!promptManager || wrappedManagers.has(promptManager)) return;
     const original = promptManager.preparePrompt;
     promptManager.preparePrompt = function (prompt, ...args) {
-        if (active && prompt.identifier === 'main' && active.system) {
+        if (active?.systemOverwriteEnabled && active.systemOverwritePrompt.trim() && prompt.identifier === 'main') {
+            // Dedicated impersonation text is already written from the intended perspective.
+            prompt = { ...prompt, role: 'system', content: active.systemOverwritePrompt };
+        } else if (active && prompt.identifier === 'main' && active.system) {
             prompt = { ...prompt, content: swapMacros(prompt.content) };
         }
         if (active?.history && prompt.identifier === 'impersonate') {
@@ -85,7 +89,11 @@ function start(type, _options, dryRun) {
     try {
         wrapPromptManager();
         swapAdditionalSources(config);
-        if (config.system) {
+        active.endContextText = config.endContextEnabled ? substituteParams(config.endContextPrompt).trim() : '';
+        if (config.systemOverwriteEnabled && config.systemOverwritePrompt.trim() && main_api !== 'openai') {
+            transaction.patch(power_user, { prefer_character_prompt: false });
+            transaction.patch(power_user.sysprompt, { enabled: true, content: config.systemOverwritePrompt });
+        } else if (config.system) {
             transaction.patch(power_user.sysprompt, { content: swapMacros(power_user.sysprompt.content) });
             const data = characters[this_chid]?.data;
             if (data) transaction.patch(data, { system_prompt: swapMacros(data.system_prompt) });
@@ -115,8 +123,31 @@ function start(type, _options, dryRun) {
     }
 }
 
+function finishChatPrompt(event) {
+    try {
+        if (active?.endContextText && !event.dryRun) appendSystemMessage(event.chat, active.endContextText);
+    } finally {
+        restore();
+    }
+}
+
+function finishTextPrompt(data) {
+    if (!active?.endContextText || main_api === 'openai') return;
+    const instruct = power_user.instruct.enabled;
+    const cue = instruct
+        ? formatInstructModePrompt(name1, true, '', name1, name2, false, false)
+        : `\n${name1}:`;
+    const formatSystem = text => instruct
+        ? formatInstructModeChat('', text, false, true, '', name1, name2, false)
+        : `${text}\n`;
+    appendTextSystemMessage(data.finalMesSend, active.endContextText, cue, formatSystem, (last, body) =>
+        last.injected === true || active.narratorMessages?.some(text => formatSystem(text).replace(/\n?$/, '') === body));
+}
+
 globalThis.impersonateSwapInterceptor = (chat, _contextSize, _abort, type) => {
-    if (type === 'impersonate' && active?.history) swapHistory(chat);
+    if (type !== 'impersonate' || !active) return;
+    active.narratorMessages = chat.filter(message => message.extra?.type === 'narrator').map(message => message.mes);
+    if (active.history) swapHistory(chat);
 };
 
 // Restore before every new generation, including aborted slash commands and dry runs.
@@ -125,7 +156,8 @@ eventSource.on(event_types.GENERATION_AFTER_COMMANDS, start);
 eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, swapLoreSources);
 // Text Completion has finished formatting/tokenizing; CC has finished preparing all prompts.
 eventSource.makeLast(event_types.GENERATE_AFTER_DATA, restore);
-eventSource.makeLast(event_types.CHAT_COMPLETION_PROMPT_READY, restore);
+eventSource.makeLast(event_types.CHAT_COMPLETION_PROMPT_READY, finishChatPrompt);
+eventSource.makeLast(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, finishTextPrompt);
 eventSource.on(event_types.GENERATION_ENDED, restore);
 eventSource.on(event_types.GENERATION_STOPPED, restore);
 eventSource.on(event_types.CHAT_CHANGED, restore);
@@ -158,6 +190,7 @@ jQuery(() => {
         lore: 'Менять {{char}} ↔ {{user}} в лоре / World Info',
         authorsNote: 'Менять {{char}} ↔ {{user}} в Author’s Note',
     };
+    const refreshPromptEditors = [];
     for (const [key, text] of Object.entries(labels)) {
         const label = document.createElement('label');
         label.className = 'checkbox_label';
@@ -167,9 +200,50 @@ jQuery(() => {
         input.addEventListener('change', () => {
             extension_settings[KEY] = { ...settings(), [key]: input.checked };
             saveSettingsDebounced();
+            refreshPromptEditors.forEach(refresh => refresh());
         });
         label.append(input, document.createTextNode(text));
         panel.querySelector('.impersonate-swap-options').append(label);
+    }
+    for (const [enabledKey, textKey, title, hint] of [
+        ['systemOverwriteEnabled', 'systemOverwritePrompt', 'System Prompt Overwrite', 'Заменяет основной системный промпт только при Impersonate.'],
+        ['endContextEnabled', 'endContextPrompt', 'End-Context System Prompt', 'Добавляется последним системным ходом; дописывается к существующему конечному system-ходу.'],
+    ]) {
+        const section = document.createElement('div');
+        section.className = 'impersonate-swap-prompt m-t-1';
+        const label = document.createElement('label');
+        label.className = 'checkbox_label';
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.checked = settings()[enabledKey];
+        label.append(toggle, document.createTextNode(title));
+        const textarea = document.createElement('textarea');
+        textarea.className = 'text_pole';
+        textarea.rows = 5;
+        textarea.value = settings()[textKey];
+        textarea.setAttribute('aria-label', title);
+        textarea.placeholder = 'Текст для Impersonate; макросы раскрываются без автоматического свапа имён.';
+        const description = document.createElement('small');
+        description.textContent = hint + ' Пустое поле ничего не меняет.';
+        const refresh = () => {
+            const enabled = settings().enabled && toggle.checked;
+            textarea.disabled = !enabled;
+            textarea.style.opacity = enabled ? '1' : '0.45';
+            description.style.opacity = enabled ? '1' : '0.45';
+        };
+        refreshPromptEditors.push(refresh);
+        toggle.addEventListener('change', () => {
+            extension_settings[KEY] = { ...settings(), [enabledKey]: toggle.checked };
+            saveSettingsDebounced();
+            refresh();
+        });
+        textarea.addEventListener('input', () => {
+            extension_settings[KEY] = { ...settings(), [textKey]: textarea.value };
+            saveSettingsDebounced();
+        });
+        section.append(label, textarea, description);
+        panel.querySelector('.inline-drawer-content').append(section);
+        refresh();
     }
     document.getElementById('extensions_settings').append(panel);
 });
