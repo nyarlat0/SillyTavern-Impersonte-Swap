@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
-import { defaults, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from '../core.mjs';
+import { defaults, cutAtSequences, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from '../core.mjs';
 
 test('swap only the two exact macros in one pass', () => {
     assert.equal(swapMacros('{{char}} {{USER}} {{ user }} {{persona}} Alice char {{character}}'),
@@ -53,7 +53,7 @@ async function fixture(api = 'openai', document = undefined) {
         makeLast(key, fn) { this.on(key, fn); },
     };
     const event_types = Object.fromEntries(['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS', 'GENERATE_AFTER_DATA',
-        'CHAT_COMPLETION_PROMPT_READY', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED', 'WORLDINFO_ENTRIES_LOADED', 'GENERATE_BEFORE_COMBINE_PROMPTS', 'CHAT_COMPLETION_SETTINGS_READY'].map(x => [x, x]));
+        'CHAT_COMPLETION_PROMPT_READY', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED', 'WORLDINFO_ENTRIES_LOADED', 'GENERATE_BEFORE_COMBINE_PROMPTS', 'CHAT_COMPLETION_SETTINGS_READY', 'IMPERSONATE_READY'].map(x => [x, x]));
     const power_user = {
         token_padding: 64, custom_stopping_strings: '["existing"]',
         sysprompt: { content: 'You are {{char}}, talk to {{user}}', post_history: '{{char}}' },
@@ -68,7 +68,7 @@ async function fixture(api = 'openai', document = undefined) {
     const oai_settings = { openai_max_tokens: 300 };
     const promptManager = { preparePrompt: prompt => ({ ...prompt }) };
     const ready = [];
-    const context = vm.createContext({ console, document, window: { addEventListener() {} }, jQuery(callback) { ready.push(callback); } });
+    const context = vm.createContext({ console, document, Event, window: { addEventListener() {} }, jQuery(callback) { ready.push(callback); } });
     const dependencies = {
         '../../../../script.js': { eventSource, event_types, characters, chat_metadata, extension_prompts, this_chid: 0, main_api: api, getMaxResponseTokens: () => 80, name1: 'Alice', name2: 'Bob',
             substituteParams: text => text.replaceAll('{{user}}', 'Alice').replaceAll('{{char}}', 'Bob'), saveSettingsDebounced() {} },
@@ -82,8 +82,11 @@ async function fixture(api = 'openai', document = undefined) {
                 return `<${role}>\n${text}</${role}>\n`;
             },
         },
+        '../../../reasoning.js': {
+            parseReasoningFromString: text => ({ content: text.replace(/^\s*<think>[\s\S]*?<\/think>\s*/, '') }),
+        },
         '../../../openai.js': { promptManager, oai_settings },
-        './core.mjs': { defaults, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction },
+        './core.mjs': { defaults, cutAtSequences, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction },
     };
     const module = new vm.SourceTextModule(await readFile(new URL('../index.js', import.meta.url), 'utf8'), { context });
     await module.link(specifier => {
@@ -98,7 +101,7 @@ async function fixture(api = 'openai', document = undefined) {
         await emit('GENERATION_STARTED', type, {}, dry);
         await emit('GENERATION_AFTER_COMMANDS', type, {}, dry);
     };
-    return { power_user, characters, chat_metadata, extension_prompts, groups, extension_settings, promptManager, oai_settings, context, emit, start, render: () => ready.forEach(callback => callback()) };
+    return { power_user, characters, chat_metadata, extension_prompts, groups, extension_settings, promptManager, oai_settings, context, eventSource, emit, start, render: () => ready.forEach(callback => callback()) };
 }
 
 test('Chat Completion changes main prompt and history, excludes other prompt blocks, cleans up', async () => {
@@ -700,4 +703,97 @@ test('new request settings honor switches, dry runs, cancellation, and native un
     await f.emit('CHAT_COMPLETION_SETTINGS_READY', native);
     assert.equal(Object.hasOwn(native, 'stop'), false);
     assert.equal(native.max_completion_tokens, 300);
+});
+
+test('Cut Sequences cuts before the first/nth literal delimiter and keeps earlier paragraphs', () => {
+    const text = 'One\n\nTwo\n\nThree\n\nFour';
+    assert.equal(cutAtSequences(text, ['\n\n'], 1), 'One');
+    assert.equal(cutAtSequences(text, ['\n\n'], 3), 'One\n\nTwo\n\nThree');
+    assert.equal(cutAtSequences(text, ['\n\n'], 4), text);
+    assert.equal(cutAtSequences(text, [], 1), text);
+    assert.equal(cutAtSequences(text, [''], 1), text);
+    assert.equal(cutAtSequences(text, ['\n\n'], 0), text);
+    assert.equal(cutAtSequences('STOP rest', ['STOP'], 1), '');
+    assert.equal(cutAtSequences('a.*b.*c', ['.*'], 2), 'a.*b');
+    assert.deepEqual(parseStoppingStrings(defaults.cutSequences), ['\n\n']);
+});
+
+test('Cut Sequences counts different delimiters together, without overlaps or duplicate matches', () => {
+    assert.equal(cutAtSequences('aXbYcXd', ['X', 'Y'], 2), 'aXb');
+    assert.equal(cutAtSequences('aXbXc', ['X', 'X'], 2), 'aXb');
+    assert.equal(cutAtSequences('a\n\nb\n\nc', ['\n', '\n\n'], 2), 'a\n\nb');
+    assert.equal(cutAtSequences('aaaab', ['aa', 'aaa'], 2), 'aaaab');
+    assert.equal(cutAtSequences('abc', ['abc'], 1), '');
+});
+
+function replyDocument(value) {
+    const textarea = { value, events: [], dispatchEvent(event) { this.events.push(event.type); } };
+    return { textarea, document: { getElementById: id => id === 'send_textarea' ? textarea : null } };
+}
+
+test('Cut Sequences reads the final textarea after native reasoning removal, not the raw event argument', async () => {
+    const raw = '<think>Thought one\n\nThought two\n\nThought three</think>\n\nOne\n\nTwo\n\nThree';
+    const { textarea, document } = replyDocument(raw);
+    const f = await fixture('openai', document);
+    f.extension_settings.impersonate_swap = { cutSequencesEnabled: true, cutSequences: '["\\n\\n"]', cutAfter: 2 };
+    f.eventSource.makeFirst('IMPERSONATE_READY', () => { textarea.value = 'One\n\nTwo\n\nThree'; });
+    await f.start();
+    await f.emit('CHAT_COMPLETION_PROMPT_READY', { chat: [] });
+    await f.emit('GENERATE_AFTER_DATA', { prompt: [] });
+    await f.emit('CHAT_COMPLETION_SETTINGS_READY', { type: 'impersonate' });
+    // ST does this before IMPERSONATE_READY for streamed replies.
+    await f.emit('GENERATION_ENDED');
+    await f.emit('IMPERSONATE_READY', raw);
+    assert.equal(textarea.value, 'One\n\nTwo');
+    assert.deepEqual(textarea.events, ['input']);
+});
+
+test('Cut Sequences excludes recognized inline reasoning even when it remains in the textarea', async () => {
+    const { textarea, document } = replyDocument('<think>A\n\nB\n\nC</think>\n\nOne\n\nTwo');
+    const f = await fixture('textgenerationwebui', document);
+    f.extension_settings.impersonate_swap = { cutSequencesEnabled: true, cutAfter: 1 };
+    await f.start();
+    await f.emit('GENERATE_AFTER_DATA', {});
+    await f.emit('IMPERSONATE_READY', 'unused raw argument');
+    assert.equal(textarea.value, 'One');
+});
+
+test('Cut Sequences snapshots settings per generation, consumes once, and does not affect ordinary replies', async () => {
+    const { textarea, document } = replyDocument('One\n\nTwo\n\nThree');
+    const f = await fixture('openai', document);
+    f.extension_settings.impersonate_swap = { cutSequencesEnabled: true, cutAfter: 2 };
+    await f.start();
+    f.extension_settings.impersonate_swap.cutAfter = 1;
+    await f.emit('IMPERSONATE_READY');
+    assert.equal(textarea.value, 'One\n\nTwo');
+    textarea.value = 'New\n\nText';
+    await f.emit('IMPERSONATE_READY');
+    assert.equal(textarea.value, 'New\n\nText');
+    await f.start('normal');
+    await f.emit('IMPERSONATE_READY');
+    assert.equal(textarea.value, 'New\n\nText');
+});
+
+test('Cut Sequences skips disabled, empty, invalid-count, dry-run and changed-chat cases', async () => {
+    const { textarea, document } = replyDocument('One\n\nTwo');
+    const f = await fixture('openai', document);
+    for (const config of [
+        {}, { enabled: false, cutSequencesEnabled: true },
+        { cutSequencesEnabled: true, cutSequences: '[]' },
+        { cutSequencesEnabled: true, cutAfter: 0 },
+        { cutSequencesEnabled: true, cutAfter: 1.5 },
+    ]) {
+        f.extension_settings.impersonate_swap = config;
+        await f.start();
+        await f.emit('IMPERSONATE_READY');
+        assert.equal(textarea.value, 'One\n\nTwo');
+    }
+    f.extension_settings.impersonate_swap = { cutSequencesEnabled: true };
+    await f.start('impersonate', true);
+    await f.emit('IMPERSONATE_READY');
+    assert.equal(textarea.value, 'One\n\nTwo');
+    await f.start();
+    await f.emit('CHAT_CHANGED');
+    await f.emit('IMPERSONATE_READY');
+    assert.equal(textarea.value, 'One\n\nTwo');
 });

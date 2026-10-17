@@ -3,14 +3,16 @@ import { extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
 import { groups, selected_group } from '../../../group-chats.js';
 import { formatInstructModeChat, formatInstructModePrompt } from '../../../instruct-mode.js';
+import { parseReasoningFromString } from '../../../reasoning.js';
 import { promptManager, oai_settings } from '../../../openai.js';
-import { defaults, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from './core.mjs';
+import { defaults, cutAtSequences, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from './core.mjs';
 
 const KEY = 'impersonate_swap';
 let active = null;
 let transaction = null;
 let requestTransaction = null;
 let requestConfig = null;
+let cutConfig = null;
 const wrappedManagers = new WeakSet();
 
 function settings() {
@@ -32,6 +34,41 @@ function restoreRequest() {
 function cleanup() {
     restore();
     restoreRequest();
+}
+
+function resetGeneration() {
+    cleanup();
+    cutConfig = null;
+}
+
+function prepareCutSettings(config) {
+    cutConfig = null;
+    if (!config.cutSequencesEnabled) return;
+    const instances = validResponseTokens(config.cutAfter);
+    if (!instances) return;
+    try {
+        const sequences = parseStoppingStrings(config.cutSequences);
+        if (sequences.length) cutConfig = { sequences, instances };
+    } catch (error) {
+        console.warn('[Impersonate Swap] Invalid Cut Sequences; cutting skipped', error);
+    }
+}
+
+function cutImpersonationReply() {
+    const config = cutConfig;
+    cutConfig = null; // Consume once, including when no match or textarea is available.
+    if (!config) return;
+    const textarea = document.getElementById('send_textarea');
+    if (!textarea) return;
+    // ST's reasoning handler runs first. The event's string can still contain raw reasoning
+    // (especially when streaming), so use the final textarea value instead.
+    const parsed = parseReasoningFromString(textarea.value);
+    const content = parsed?.content ?? textarea.value;
+    const result = cutAtSequences(content, config.sequences, config.instances);
+    if (result !== textarea.value) {
+        textarea.value = result;
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
 }
 
 function prepareRequestSettings(config) {
@@ -149,13 +186,14 @@ function swapLoreSources(sources) {
 }
 
 function start(type, _options, dryRun) {
-    cleanup();
+    resetGeneration();
     const config = settings();
     // ST skips history interceptors for token-count dry runs. Never apply half a swap.
     if (type !== 'impersonate' || dryRun || !config.enabled) return;
     active = config;
     transaction = new PromptTransaction();
     try {
+        prepareCutSettings(config);
         prepareRequestSettings(config);
         wrapPromptManager();
         swapAdditionalSources(config);
@@ -187,7 +225,7 @@ function start(type, _options, dryRun) {
             transaction.patch(instruct, { last_input_sequence: instruct.last_output_sequence || instruct.output_sequence || ' ' });
         }
     } catch (error) {
-        cleanup();
+        resetGeneration();
         console.error('[Impersonate Swap] Failed to prepare prompt', error);
         throw error;
     }
@@ -226,7 +264,7 @@ globalThis.impersonateSwapInterceptor = (chat, _contextSize, _abort, type) => {
 };
 
 // Restore before every new generation, including aborted slash commands and dry runs.
-eventSource.makeFirst(event_types.GENERATION_STARTED, cleanup);
+eventSource.makeFirst(event_types.GENERATION_STARTED, resetGeneration);
 eventSource.on(event_types.GENERATION_AFTER_COMMANDS, start);
 eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, swapLoreSources);
 // Text Completion has finished formatting/tokenizing; CC has finished preparing all prompts.
@@ -234,11 +272,13 @@ eventSource.makeLast(event_types.GENERATE_AFTER_DATA, finishGenerationData);
 eventSource.makeLast(event_types.CHAT_COMPLETION_SETTINGS_READY, finishChatSettings);
 eventSource.makeLast(event_types.CHAT_COMPLETION_PROMPT_READY, finishChatPrompt);
 eventSource.makeLast(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, finishTextPrompt);
+// Streaming may emit GENERATION_ENDED before IMPERSONATE_READY. Keep the cut snapshot until ready.
+eventSource.makeLast(event_types.IMPERSONATE_READY, cutImpersonationReply);
 eventSource.on(event_types.GENERATION_ENDED, cleanup);
 eventSource.on(event_types.GENERATION_STOPPED, cleanup);
-eventSource.on(event_types.CHAT_CHANGED, cleanup);
-window.addEventListener('unhandledrejection', cleanup);
-window.addEventListener('error', cleanup);
+eventSource.on(event_types.CHAT_CHANGED, resetGeneration);
+window.addEventListener('unhandledrejection', resetGeneration);
+window.addEventListener('error', resetGeneration);
 
 jQuery(() => {
     const panel = document.createElement('div');
@@ -374,5 +414,56 @@ jQuery(() => {
         panel.querySelector('.inline-drawer-content').append(section);
         refresh();
     }
+    const cutSection = document.createElement('div');
+    cutSection.className = 'impersonate-swap-cut-sequences m-t-1';
+    const cutLabel = document.createElement('label');
+    cutLabel.className = 'checkbox_label';
+    const cutToggle = document.createElement('input');
+    cutToggle.type = 'checkbox';
+    cutToggle.checked = settings().cutSequencesEnabled;
+    cutLabel.append(cutToggle, document.createTextNode('Cut Sequences'));
+    const cutInput = document.createElement('textarea');
+    cutInput.className = 'text_pole';
+    cutInput.rows = 3;
+    cutInput.value = settings().cutSequences;
+    cutInput.placeholder = '["\\n\\n"]';
+    cutInput.setAttribute('aria-label', 'Cut Sequences');
+    const countLabel = document.createElement('label');
+    const countInput = document.createElement('input');
+    countInput.type = 'number';
+    countInput.className = 'text_pole';
+    countInput.min = '1';
+    countInput.step = '1';
+    countInput.value = settings().cutAfter;
+    countInput.setAttribute('aria-label', 'Cut after instances');
+    countLabel.append(document.createTextNode('After '), countInput, document.createTextNode(' instances'));
+    const cutHelp = document.createElement('small');
+    const refreshCut = () => {
+        const enabled = settings().enabled && cutToggle.checked;
+        cutInput.disabled = countInput.disabled = !enabled;
+        cutInput.style.opacity = countLabel.style.opacity = cutHelp.style.opacity = enabled ? '1' : '0.45';
+        let sequenceError = '';
+        try { parseStoppingStrings(cutInput.value); }
+        catch { sequenceError = 'Cut Sequences: нужен JSON-массив строк или по одной последовательности на строку.'; }
+        const countError = validResponseTokens(countInput.value) ? '' : 'After instances: введите целое число больше нуля.';
+        cutInput.setCustomValidity?.(sequenceError);
+        countInput.setCustomValidity?.(countError);
+        cutHelp.textContent = sequenceError || countError || 'Обрезает готовый ответ перед указанным совпадением, после удаления reasoning. ["\\n\\n"] и 3 — до третьего разделителя абзацев. Не останавливает генерацию.';
+    };
+    refreshPromptEditors.push(refreshCut);
+    for (const [input, event, key] of [
+        [cutToggle, 'change', 'cutSequencesEnabled'],
+        [cutInput, 'input', 'cutSequences'],
+        [countInput, 'input', 'cutAfter'],
+    ]) {
+        input.addEventListener(event, () => {
+            extension_settings[KEY] = { ...settings(), [key]: input === cutToggle ? input.checked : input.value };
+            saveSettingsDebounced();
+            refreshCut();
+        });
+    }
+    cutSection.append(cutLabel, cutInput, countLabel, cutHelp);
+    panel.querySelector('.inline-drawer-content').append(cutSection);
+    refreshCut();
     document.getElementById('extensions_settings').append(panel);
 });

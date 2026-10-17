@@ -140,6 +140,26 @@ Existing custom strings come first; duplicates are removed. Empty entries are ig
 
 The extension uses SillyTavern's native stopping-string path, preserving generated name/Instruct stops and the backend's conversion (including tokenized NovelAI stops). Model/provider limits still apply: if existing strings fill the supported slots, some additions may not be sent. A model for which SillyTavern disables stop strings does not gain support through this setting.
 
+### Cut Sequences
+
+Trims the **completed Impersonate reply after reasoning removal**. Enable **Cut Sequences**, enter literal sequences (one per line or a JSON array), and set **After … instances** to the occurrence at which the answer should be cut. The matched delimiter and everything after it are excluded.
+
+To keep up to three paragraphs separated by a blank line:
+
+```json
+["\n\n"]
+```
+
+Set **After 3 instances**. For `Paragraph 1 → blank line → Paragraph 2 → blank line → Paragraph 3 → blank line → Paragraph 4`, the result contains paragraphs 1–3. If fewer than three separators occur, the visible reply is unchanged. Use JSON escapes for newlines; empty lines in the editor are not sequences.
+
+- Off by default, with `["\n\n"]` and a count of **1** ready to use. Disabled editors are dimmed and retain their values.
+- Sequences are literal, case-sensitive text, not regular expressions or macros. Empty strings are ignored. With multiple sequences, occurrences are counted together in text order, without overlaps; at the same position the longest sequence wins and counts once.
+- The count must be a positive integer. Invalid input disables cutting for that generation and shows a validation message.
+- The final input-box text is processed after SillyTavern's reasoning handler, for both streaming and non-streaming replies. Any remaining reasoning block recognized by SillyTavern's selected reasoning format is removed before counting, even if automatic parsing is off. Configure the reasoning format to match your model; unknown formats cannot be reliably separated.
+- Unlike stopping strings, this does **not** stop generation or reduce generated tokens. Do not also add the paragraph separator to stopping strings if you want multiple paragraphs: the API would stop before later occurrences exist.
+
+Cut settings are captured when Impersonate starts. Changes made during generation apply to the next reply. The saved chat and ordinary character replies are unaffected.
+
 ## Compatibility and limitations
 
 - **Chat Completion:** swaps API roles and suppresses SillyTavern's standard Impersonate instruction when history swapping is enabled.

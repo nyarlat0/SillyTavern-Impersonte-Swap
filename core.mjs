@@ -1,7 +1,8 @@
 export const defaults = Object.freeze({ enabled: true, history: true, system: true, context: true, contextDescriptions: true,
     character: false, persona: false, scenario: false, lore: false, authorsNote: false,
     endContextEnabled: false, endContextPrompt: '', systemOverwriteEnabled: false, systemOverwritePrompt: '',
-    responseTokensEnabled: false, responseTokens: 256, stoppingStringsEnabled: false, stoppingStrings: '' });
+    responseTokensEnabled: false, responseTokens: 256, stoppingStringsEnabled: false, stoppingStrings: '',
+    cutSequencesEnabled: false, cutSequences: '["\\n\\n"]', cutAfter: 1 });
 
 export function validResponseTokens(value) {
     const number = Number(value);
@@ -15,6 +16,29 @@ export function parseStoppingStrings(value) {
         throw new Error('Stopping strings: ожидаются строки или JSON-массив строк.');
     }
     return [...new Set(values.filter(item => item.length > 0))];
+}
+
+/** Count literal, non-overlapping matches across all sequences; exclude the cut delimiter. */
+export function cutAtSequences(text, sequences, instances) {
+    const count = validResponseTokens(instances);
+    const needles = [...new Set(sequences.filter(value => typeof value === 'string' && value.length > 0))];
+    if (!count || !needles.length) return text;
+    let cursor = 0;
+    for (let occurrence = 1; occurrence <= count; occurrence++) {
+        let position = -1;
+        let length = 0;
+        for (const sequence of needles) {
+            const index = text.indexOf(sequence, cursor);
+            if (index >= 0 && (position < 0 || index < position || (index === position && sequence.length > length))) {
+                position = index;
+                length = sequence.length;
+            }
+        }
+        if (position < 0) return text;
+        if (occurrence === count) return text.slice(0, position);
+        cursor = position + length;
+    }
+    return text;
 }
 
 export function overrideResponseTokens(data, limit) {
