@@ -3,7 +3,7 @@ import { extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
 import { groups, selected_group } from '../../../group-chats.js';
 import { promptManager } from '../../../openai.js';
-import { defaults, swapMacros, swapHistory, PromptTransaction } from './core.mjs';
+import { defaults, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from './core.mjs';
 
 const KEY = 'impersonate_swap';
 let active = null;
@@ -91,10 +91,15 @@ function start(type, _options, dryRun) {
             if (data) transaction.patch(data, { system_prompt: swapMacros(data.system_prompt) });
             transaction.patch(chat_metadata, { system_prompt: swapMacros(chat_metadata.system_prompt) });
         }
-        if (config.context && main_api !== 'openai') {
+        if ((config.context || config.contextDescriptions) && main_api !== 'openai') {
             const context = power_user.context;
             transaction.patch(context, Object.fromEntries(
-                ['story_string', 'chat_start', 'example_separator'].map(key => [key, swapMacros(context[key])]),
+                ['story_string', 'chat_start', 'example_separator'].map(key => {
+                    let template = context[key];
+                    if (config.context) template = swapMacros(template);
+                    if (config.contextDescriptions) template = swapContextDescriptions(template);
+                    return [key, template];
+                }),
             ));
         }
         if (config.history && main_api !== 'openai' && power_user.instruct.enabled) {
@@ -138,7 +143,7 @@ jQuery(() => {
         <div class="inline-drawer-content">
             <p>Обмен ролями только при Impersonate. Результат остаётся в поле ввода.</p>
             <div class="impersonate-swap-options"></div>
-            <small>Context template используется только в Text Completion. Новые области замены выключены по умолчанию. Тексты сообщений и буквальные имена не меняются.</small>
+            <small>Context template используется только в Text Completion. Замена макросов в карточке, персоне, сценарии, лоре и Author’s Note выключена по умолчанию. Тексты сообщений и буквальные имена не меняются.</small>
         </div>
     </div>`;
     const labels = {
@@ -146,6 +151,7 @@ jQuery(() => {
         history: 'Менять user ↔ assistant в истории',
         system: 'Менять {{char}} ↔ {{user}} в System Prompt',
         context: 'Менять {{char}} ↔ {{user}} в Context Template',
+        contextDescriptions: 'Менять {{persona}} ↔ {{description}} и обнулять {{personality}} в Context Template',
         character: 'Менять {{char}} ↔ {{user}} в карточке (описание, личность, примеры, depth prompt)',
         persona: 'Менять {{char}} ↔ {{user}} в описании персоны',
         scenario: 'Менять {{char}} ↔ {{user}} в сценарии',

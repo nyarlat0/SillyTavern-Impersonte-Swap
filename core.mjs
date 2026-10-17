@@ -1,4 +1,4 @@
-export const defaults = Object.freeze({ enabled: true, history: true, system: true, context: true,
+export const defaults = Object.freeze({ enabled: true, history: true, system: true, context: true, contextDescriptions: true,
     character: false, persona: false, scenario: false, lore: false, authorsNote: false });
 
 // One pass: replacements must not replace each other. Names and other macros are untouched.
@@ -6,6 +6,19 @@ export function swapMacros(text) {
     return typeof text === 'string'
         ? text.replace(/{{\s*(char|user)\s*}}/gi, (_, role) => role.toLowerCase() === 'char' ? '{{user}}' : '{{char}}')
         : text;
+}
+
+// Change template references, never the descriptions themselves or their nested macros.
+export function swapContextDescriptions(text) {
+    if (typeof text !== 'string') return text;
+    const swapped = { persona: 'description', description: 'persona' };
+    return text
+        // Keep standard Handlebars guards aligned with the substituted value. In particular,
+        // an empty personality must also hide a surrounding "Personality:" label.
+        .replace(/({{~?\s*#(?:if|unless|with)\s+)(persona|description|personality)(\s*~?}})/gi,
+            (_, prefix, field, suffix) => prefix + (swapped[field.toLowerCase()] ?? '""') + suffix)
+        .replace(/({{{?~?\s*)(persona|description|personality)(\s*~?}}}?)/gi,
+            (_, prefix, field, suffix) => field.toLowerCase() === 'personality' ? '' : prefix + swapped[field.toLowerCase()] + suffix);
 }
 
 export function swapHistory(chat) {

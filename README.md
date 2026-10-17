@@ -53,7 +53,7 @@ is processed as:
 You are {{user}}. Continue the conversation with {{char}}.
 ```
 
-Only these two macros are exchanged. Literal names such as `Alice` are not replaced. Character and persona descriptions are not moved into each other's fields.
+The name-swap switches exchange only these two macros. Literal names such as `Alice` are not replaced. A separate Context Template option, enabled by default, exchanges `{{persona}}` and `{{description}}` and removes `{{personality}}` from the template. The saved character and persona fields stay unchanged.
 
 ## Settings
 
@@ -65,11 +65,14 @@ The labels in the extension settings are currently in Russian. The table include
 | History / «в истории» | On | Swaps user/assistant roles in the outgoing history. |
 | System Prompt | On | Swaps macros in the Text Completion System Prompt or Chat Completion Main Prompt, including character/chat system-prompt overrides. |
 | Context Template | On | Swaps macros in Story String, Chat Start, and Example Separator. Text Completion only. |
+| Context descriptions / «Менять {{persona}} ↔ {{description}}…» | On | Exchanges persona/character description references and clears personality in Context Template. Independent of the name swap; Text Completion only. |
 | Character card / «в карточке» | Off | Swaps macros in description, personality, example dialogue, and character depth prompt. Includes the chat's example-dialogue override and cards used in group chats. |
 | Persona / «в описании персоны» | Off | Swaps macros in the active persona description, including when it is inserted at depth or into Author's Note. |
 | Scenario / «в сценарии» | Off | Swaps macros in the character scenario and the chat's scenario override. Separate from the card switch. |
 | Lore / World Info | Off | Swaps macros in entry content from global, character, chat, and persona lorebooks. Entry keywords and activation settings are not rewritten. |
 | Author's Note | Off | Swaps macros in the chat note and enabled character-specific note. Lore and persona additions follow their own switches. |
+
+The description option sits immediately below the Context Template name-swap option. It applies to Story String, Chat Start, and Example Separator. Standard `{{#if …}}`, `{{#unless …}}`, and `{{#with …}}` guards for these fields follow the replacement, so a personality section guarded by `{{#if personality}}` is hidden. It does not rewrite macros inside the inserted descriptions or change Chat Completion prompts. Existing installations also get this option enabled unless explicitly disabled.
 
 The five optional source switches default to **Off**, including when upgrading an existing installation. Settings apply on the next generation.
 

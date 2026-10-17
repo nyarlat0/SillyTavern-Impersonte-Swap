@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
-import { defaults, swapMacros, swapHistory, PromptTransaction } from '../core.mjs';
+import { defaults, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from '../core.mjs';
 
 test('swap only the two exact macros in one pass', () => {
     assert.equal(swapMacros('{{char}} {{USER}} {{ user }} {{persona}} Alice char {{character}}'),
@@ -72,7 +72,7 @@ async function fixture(api = 'openai') {
         '../../../power-user.js': { power_user },
         '../../../group-chats.js': { groups, selected_group: 'group' },
         '../../../openai.js': { promptManager },
-        './core.mjs': { defaults, swapMacros, swapHistory, PromptTransaction },
+        './core.mjs': { defaults, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction },
     };
     const module = new vm.SourceTextModule(await readFile(new URL('../index.js', import.meta.url), 'utf8'), { context });
     await module.link(specifier => {
@@ -118,7 +118,7 @@ test('Text Completion uses assistant continuation marker and restores all settin
     await f.start();
     assert.equal(f.power_user.instruct.last_input_sequence, '<assistant>');
     assert.equal(f.power_user.instruct.input_sequence, '<user>');
-    assert.equal(f.power_user.context.story_string, '{{user}}: {{description}} {{char}}: {{persona}}');
+    assert.equal(f.power_user.context.story_string, '{{user}}: {{persona}} {{char}}: {{description}}');
     assert.equal(f.power_user.sysprompt.post_history, '{{char}}');
     await f.emit('GENERATION_STOPPED');
     assert.deepEqual(f.power_user, original);
@@ -262,4 +262,50 @@ test('group card scopes include members but exclude unrelated characters', async
     assert.equal(f.characters[2].description, '{{char}} Other');
     await f.emit('GENERATION_ENDED');
     assert.equal(f.characters[1].description, '{{char}} Bob');
+});
+
+test('context descriptions swap in one pass and clear personality including standard guards', () => {
+    assert.equal(swapContextDescriptions('{{persona}}|{{description}}|{{personality}}|{{scenario}}'),
+        '{{description}}|{{persona}}||{{scenario}}');
+    assert.equal(swapContextDescriptions('{{#if persona}}{{{persona}}}{{/if}}{{#if description}}{{description}}{{/if}}{{#if personality}}Personality: {{personality}}{{/if}}'),
+        '{{#if description}}{{{description}}}{{/if}}{{#if persona}}{{persona}}{{/if}}{{#if ""}}Personality: {{/if}}');
+    assert.equal(swapContextDescriptions('{{ PERSONA }} {{~description~}} {{personality_summary}}'),
+        '{{ description }} {{~persona~}} {{personality_summary}}');
+    assert.equal(swapContextDescriptions(undefined), undefined);
+});
+
+test('description setting defaults on, is independent of name swap, and restores context', async () => {
+    for (const names of [false, true]) {
+        for (const descriptions of [undefined, false, true]) {
+            const f = await fixture('textgenerationwebui');
+            populateSources(f);
+            f.power_user.context.story_string = '{{char}} {{persona}} {{description}} {{personality}}';
+            f.power_user.context.chat_start = '{{persona}} {{personality}}';
+            f.power_user.context.example_separator = '{{description}}';
+            f.extension_settings.impersonate_swap = { context: names };
+            if (descriptions !== undefined) f.extension_settings.impersonate_swap.contextDescriptions = descriptions;
+            const before = structuredClone(f.power_user.context);
+            await f.start();
+            assert.equal(f.power_user.context.story_string,
+                (names ? '{{user}} ' : '{{char}} ') + (descriptions !== false
+                    ? '{{description}} {{persona}} ' : '{{persona}} {{description}} {{personality}}'));
+            assert.equal(f.power_user.context.chat_start, descriptions !== false ? '{{description}} ' : '{{persona}} {{personality}}');
+            assert.equal(f.power_user.context.example_separator, descriptions !== false ? '{{persona}}' : '{{description}}');
+            assert.deepEqual(JSON.parse(JSON.stringify(f.power_user.context)), before);
+            assert.equal(f.characters[0].description, '{{char}} description');
+            assert.equal(f.characters[0].personality, '{{user}} personality');
+            assert.equal(f.power_user.persona_description, '{{user}} persona');
+            await f.emit('GENERATE_AFTER_DATA');
+            assert.deepEqual(f.power_user.context, before);
+        }
+    }
+});
+
+test('context description swap does not affect Chat Completion', async () => {
+    const f = await fixture('openai');
+    f.power_user.context.story_string = '{{persona}} {{description}} {{personality}}';
+    const before = structuredClone(f.power_user.context);
+    await f.start();
+    assert.deepEqual(f.power_user.context, before);
+    await f.emit('CHAT_COMPLETION_PROMPT_READY');
 });
