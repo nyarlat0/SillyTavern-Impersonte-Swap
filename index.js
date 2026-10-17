@@ -140,8 +140,13 @@ function finishTextPrompt(data) {
     const formatSystem = text => instruct
         ? formatInstructModeChat('', text, false, true, '', name1, name2, false)
         : `${text}\n`;
+    const marker = '__IMPERSONATE_SWAP_SYSTEM_CONTENT__';
+    const systemPrefix = formatSystem(marker).split(marker)[0];
+    const recognizeFrames = instruct && [true, false].every(isUser =>
+        formatInstructModeChat('', marker, isUser, false, '', name1, name2, false).split(marker)[0] !== systemPrefix);
     appendTextSystemMessage(data.finalMesSend, active.endContextText, cue, formatSystem, (last, body) =>
-        last.injected === true || active.narratorMessages?.some(text => formatSystem(text).replace(/\n?$/, '') === body));
+        last.injected === true || active.narratorMessages?.some(text => formatSystem(text).trimEnd() === body.trimEnd()),
+    { recognizeFrames, trimFinalNewline: !instruct || power_user.instruct.wrap });
 }
 
 globalThis.impersonateSwapInterceptor = (chat, _contextSize, _abort, type) => {

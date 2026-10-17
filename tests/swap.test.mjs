@@ -75,7 +75,10 @@ async function fixture(api = 'openai', document = undefined) {
         '../../../group-chats.js': { groups, selected_group: 'group' },
         '../../../instruct-mode.js': {
             formatInstructModePrompt: () => '\n<assistant>',
-            formatInstructModeChat: (_name, text) => `<system>\n${text}</system>\n`,
+            formatInstructModeChat: (_name, text, isUser, isNarrator) => {
+                const role = isNarrator ? 'system' : isUser ? 'user' : 'assistant';
+                return `<${role}>\n${text}</${role}>\n`;
+            },
         },
         '../../../openai.js': { promptManager },
         './core.mjs': { defaults, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction },
@@ -330,7 +333,8 @@ test('end system message appends to an existing system turn, preserving metadata
     appendSystemMessage(multimodal, 'End');
     assert.equal(multimodal.length, 1);
     assert.equal(multimodal[0].content[1], parts[1]);
-    assert.equal(multimodal[0].content.at(-1).text, '\n\nEnd');
+    assert.equal(multimodal[0].content.at(-1).text, 'End');
+    assert.equal(multimodal[0].content.at(-2).text, '\n\n');
     assert.equal(parts.length, 2);
     appendSystemMessage([], '  ');
 });
@@ -422,7 +426,7 @@ test('plain text end prompt preserves the user name cue and empty history', () =
     assert.equal(items[0].message, 'Bob: Hi\nEnd\nAlice:');
     const empty = [];
     appendTextSystemMessage(empty, 'End', '\nAlice:', text => `${text}\n`, () => false);
-    assert.equal(empty[0].message, 'End\n\nAlice:');
+    assert.equal(empty[0].message, 'End\nAlice:');
 });
 
 test('final Narrator message merges even when it is not an extension injection', async () => {
@@ -465,10 +469,11 @@ test('end prompt works with the installed ST Instruct formatter, including wrapp
                 vm.runInContext(extract('formatInstructModeChat') + '\n' + extract('formatInstructModePrompt'), context);
                 const format = text => context.formatInstructModeChat('', text, false, true, '', 'Alice', 'Bob', false);
                 const cue = context.formatInstructModePrompt('Alice', true, '', 'Alice', 'Bob', false, false);
-                const body = format('Note').replace(/\n?$/, '');
+                const finalFormat = text => wrap ? format(text).replace(/\n?$/, '') : format(text);
+                const body = finalFormat('Note');
                 const items = [{ message: body + cue, extensionPrompts: [], injected: true }];
-                appendTextSystemMessage(items, 'End', cue, format, () => true);
-                assert.equal(items[0].message, format('Note\n\nEnd').replace(/\n?$/, '') + cue);
+                appendTextSystemMessage(items, 'End', cue, format, () => true, { trimFinalNewline: wrap });
+                assert.equal(items[0].message, finalFormat('Note\n\nEnd') + cue);
             }
         }
     }
@@ -521,4 +526,84 @@ test('prompt editors retain saved text and dim/disable with their own switch or 
     assert.ok(sections.every(section => !section.children[1].disabled));
     assert.equal(f.extension_settings.impersonate_swap.systemOverwritePrompt, 'Edited');
     assert.equal(f.extension_settings.impersonate_swap.endContextPrompt, 'Edited');
+});
+
+test('Chat Completion collapses the complete terminal system run, without crossing other roles', () => {
+    const chat = [
+        { role: 'system', content: 'Main' },
+        { role: 'user', content: 'Hi' },
+        { role: 'system', content: 'Author note' },
+        { role: 'system', content: 'Another instruction' },
+    ];
+    appendSystemMessage(chat, 'End');
+    assert.deepEqual(chat, [
+        { role: 'system', content: 'Main' },
+        { role: 'user', content: 'Hi' },
+        { role: 'system', content: 'Author note\n\nAnother instruction\n\nEnd' },
+    ]);
+});
+
+test('serialized adjacent system turns have exactly one opening and closing marker after merging', () => {
+    const format = text => `<turn>system\n${text}</turn>\n`;
+    const cue = '<turn>assistant\n';
+    for (const grouped of [true, false]) {
+        const turns = [format('Author note'), format('Other note')];
+        const items = grouped
+            ? [{ message: turns.join('') + cue, extensionPrompts: [] }]
+            : turns.map((message, index) => ({ message: message + (index === 1 ? cue : ''), extensionPrompts: [] }));
+        appendTextSystemMessage(items, 'End', cue, format, () => false, { trimFinalNewline: false });
+        const prompt = items.map(item => item.message).join('');
+        assert.equal(prompt, format('Author note\n\nOther note\n\nEnd') + cue);
+        assert.equal(prompt.split('<turn>system').length - 1, 1);
+        assert.equal(prompt.split('</turn>').length - 1, 1);
+    }
+});
+
+test('unwrapped Instruct preserves the newline after the closing system marker and appends inside it', () => {
+    const format = text => `<turn>system\n${text}</turn>\n`;
+    const items = [{ message: format('Author note') + '<turn>assistant\n', extensionPrompts: [], injected: true }];
+    appendTextSystemMessage(items, 'End', '<turn>assistant\n', format, () => true, { trimFinalNewline: false });
+    assert.equal(items[0].message, '<turn>system\nAuthor note\n\nEnd</turn>\n<turn>assistant\n');
+});
+
+test('terminal-system detection does not absorb a later user or assistant turn with the same end token', () => {
+    const format = text => `<turn>system\n${text}</turn>`;
+    const cue = '<turn>assistant\n';
+    for (const role of ['user', 'assistant']) {
+        const body = format('Old system') + `<turn>${role}\nMessage</turn>`;
+        const items = [{ message: body + cue, extensionPrompts: [] }];
+        appendTextSystemMessage(items, 'End', cue, format, () => false);
+        assert.equal(items[0].message, body + '\n' + format('End') + cue);
+    }
+});
+
+test('system merging preserves earlier turns in a combined item and stops at intervening extension prompts', () => {
+    const format = text => `<turn>system\n${text}</turn>\n`;
+    const cue = '<turn>assistant\n';
+    const user = '<turn>user\nHello</turn>\n';
+    const combined = [{ message: user + format('Note A') + format('Note B') + cue, extensionPrompts: [] }];
+    appendTextSystemMessage(combined, 'End', cue, format, () => false, { trimFinalNewline: false });
+    assert.equal(combined[0].message, user + format('Note A\n\nNote B\n\nEnd') + cue);
+    const barrier = [
+        { message: format('Earlier'), extensionPrompts: [] },
+        { message: format('Last') + cue, extensionPrompts: [user] },
+    ];
+    appendTextSystemMessage(barrier, 'End', cue, format, () => false, { trimFinalNewline: false });
+    assert.equal(barrier[0].message, format('Earlier'));
+    assert.equal(barrier[1].message, format('Last\n\nEnd') + cue);
+    assert.equal(barrier[1].extensionPrompts[0], user);
+});
+
+test('generation hook merges system frames with wrap disabled and no injected metadata', async () => {
+    const f = await fixture('textgenerationwebui');
+    f.power_user.instruct.wrap = false;
+    f.extension_settings.impersonate_swap = { endContextEnabled: true, endContextPrompt: 'End' };
+    await f.start();
+    const data = { finalMesSend: [
+        { message: '<system>\nNote A</system>\n', extensionPrompts: [] },
+        { message: '<system>\nNote B</system>\n\n<assistant>', extensionPrompts: [] },
+    ] };
+    await f.emit('GENERATE_BEFORE_COMBINE_PROMPTS', data);
+    assert.equal(data.finalMesSend.map(item => item.message).join(''), '<system>\nNote A\n\nNote B\n\nEnd</system>\n\n<assistant>');
+    await f.emit('GENERATE_AFTER_DATA');
 });

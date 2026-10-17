@@ -6,25 +6,36 @@ export function joinPromptText(before, after) {
     return before ? `${before}\n\n${after}` : after;
 }
 
-export function appendSystemMessage(chat, text) {
-    if (!text.trim()) return;
-    const last = chat.at(-1);
-    if (last?.role !== 'system') {
-        chat.push({ role: 'system', content: text });
-    } else if (Array.isArray(last.content)) {
-        // Preserve multimodal content and metadata; do not stringify image/audio parts.
-        last.content = [...last.content, { type: 'text', text: `\n\n${text}` }];
-    } else {
-        last.content = joinPromptText(last.content ?? '', text);
-    }
+function joinSystemContent(before, after) {
+    if (!Array.isArray(before) && !Array.isArray(after)) return joinPromptText(before ?? '', after ?? '');
+    const parts = value => Array.isArray(value) ? value : (value ? [{ type: 'text', text: value }] : []);
+    return [...parts(before), { type: 'text', text: '\n\n' }, ...parts(after)];
 }
 
-/** Insert before the generation cue, merging a final formatted system injection. */
-export function appendTextSystemMessage(items, text, cue, formatSystem, canMergeSystem) {
+export function appendSystemMessage(chat, text) {
     if (!text.trim()) return;
+    let start = chat.length;
+    while (start > 0 && chat[start - 1].role === 'system') start--;
+    if (start === chat.length) {
+        chat.push({ role: 'system', content: text });
+        return;
+    }
+    const merged = { ...chat[start] };
+    for (let i = start + 1; i < chat.length; i++) {
+        merged.content = joinSystemContent(merged.content, chat[i].content);
+    }
+    merged.content = joinSystemContent(merged.content, text);
+    chat.splice(start, chat.length - start, merged);
+}
+
+/** Collapse the terminal system run into one formatted turn, before the response cue. */
+export function appendTextSystemMessage(items, text, cue, formatSystem, canMergeSystem,
+    { recognizeFrames = true, trimFinalNewline = true } = {}) {
+    if (!text.trim()) return;
+    const formatFinal = value => trimFinalNewline ? formatSystem(value).replace(/\n?$/, '') : formatSystem(value);
     const last = items.at(-1);
     if (!last) {
-        items.push({ message: formatSystem(text) + cue, extensionPrompts: [] });
+        items.push({ message: formatFinal(text) + cue, extensionPrompts: [] });
         return;
     }
     const cueIndex = cue ? last.message.lastIndexOf(cue) : last.message.length;
@@ -32,16 +43,55 @@ export function appendTextSystemMessage(items, text, cue, formatSystem, canMerge
     const body = last.message.slice(0, cueIndex);
     const tail = last.message.slice(cueIndex);
     const marker = '__IMPERSONATE_SWAP_SYSTEM_CONTENT__';
-    // ST strips a final newline from the last history item before adding the response cue.
-    const formatted = formatSystem(marker).replace(/\n?$/, '');
-    const [prefix, suffix] = formatted.split(marker);
-    if (canMergeSystem(last, body) && body.startsWith(prefix) && body.endsWith(suffix)) {
-        const contentEnd = suffix ? body.length - suffix.length : body.length;
-        const content = body.slice(prefix.length, contentEnd);
-        last.message = prefix + joinPromptText(content, text) + suffix + tail;
+    const [prefix, rawSuffix] = formatSystem(marker).split(marker);
+    const suffix = rawSuffix.trimEnd();
+
+    function takeSystemEnd(value, item) {
+        const trimmed = value.trimEnd();
+        const trailing = value.slice(trimmed.length);
+        // Explicit, distinct role markers also identify a system turn inside a combined item.
+        // If the template shares role markers or has no closing token, require role evidence.
+        if (recognizeFrames && prefix && suffix) {
+            const start = trimmed.lastIndexOf(prefix);
+            const contentStart = start + prefix.length;
+            if (start < 0 || !trimmed.endsWith(suffix)) return null;
+            const end = trimmed.length - suffix.length;
+            // A user/assistant turn after this system turn is a barrier, even with a shared end token.
+            if (trimmed.indexOf(suffix, contentStart) !== end) return null;
+            return { head: value.slice(0, start), content: value.slice(contentStart, end), ending: suffix + trailing };
+        }
+        if (canMergeSystem(item, value) && trimmed.startsWith(prefix) && trimmed.endsWith(suffix)) {
+            return { head: '', content: trimmed.slice(prefix.length, suffix ? -suffix.length : undefined), ending: suffix + trailing };
+        }
+        return null;
+    }
+
+    const contents = [];
+    let index = items.length - 1;
+    let remaining = body;
+    let ending;
+    const consumed = [];
+    while (true) {
+        const frame = takeSystemEnd(remaining, items[index]);
+        if (!frame) break;
+        ending ??= frame.ending;
+        contents.unshift(frame.content);
+        remaining = frame.head;
+        if (remaining.trim()) continue;
+        // Extension prompts inserted between items must not be crossed or reordered.
+        if (index === 0 || items[index].extensionPrompts?.length) break;
+        const previous = items[index - 1];
+        if (!takeSystemEnd(previous.message, previous)) break;
+        consumed.push(index - 1);
+        remaining = previous.message;
+        index--;
+    }
+    if (contents.length) {
+        for (const consumedIndex of consumed) items[consumedIndex].message = '';
+        last.message = remaining + prefix + [...contents, text].join('\n\n') + ending + tail;
     } else {
         const separator = body && !body.endsWith('\n') ? '\n' : '';
-        last.message = body + separator + formatSystem(text).replace(/\n?$/, '') + tail;
+        last.message = body + separator + formatFinal(text) + tail;
     }
 }
 

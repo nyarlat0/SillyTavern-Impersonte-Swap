@@ -97,9 +97,9 @@ Respond to {{char}} without writing dialogue or actions for them.
 
 ### End-Context System Prompt
 
-Adds a final system instruction after the assembled context. If the last Chat Completion message is already `system`, the text is appended to that message after a blank line; otherwise a new `system` message is added. This includes a final system Author's Note.
+Adds a final system instruction after the assembled context. If Chat Completion ends with one or more consecutive `system` messages, their contents and the new text are combined into **one system message**, separated by blank lines; otherwise a new `system` message is added. This includes a final system Author's Note.
 
-For Text Completion, it is inserted before the final response cue using the Instruct template's system format, and appended to a final system injection when its formatting matches. A plain-text template has no API roles, so it uses SillyTavern's plain narrator format.
+For Text Completion, it is inserted before the final response cue using the Instruct template's system format, and merged into the terminal run of system turns. The merged turn has **one opening and one closing system marker**, including templates that keep a newline after the closing marker. User and assistant turns are not crossed. A plain-text template has no API roles, so it uses SillyTavern's plain narrator format.
 
 Example:
 
