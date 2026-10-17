@@ -1,14 +1,16 @@
-import { eventSource, event_types, saveSettingsDebounced, characters, this_chid, chat_metadata, main_api, extension_prompts, substituteParams, name1, name2 } from '../../../../script.js';
+import { eventSource, event_types, saveSettingsDebounced, characters, this_chid, chat_metadata, main_api, extension_prompts, substituteParams, name1, name2, getMaxResponseTokens } from '../../../../script.js';
 import { extension_settings } from '../../../extensions.js';
 import { power_user } from '../../../power-user.js';
 import { groups, selected_group } from '../../../group-chats.js';
 import { formatInstructModeChat, formatInstructModePrompt } from '../../../instruct-mode.js';
-import { promptManager } from '../../../openai.js';
-import { defaults, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from './core.mjs';
+import { promptManager, oai_settings } from '../../../openai.js';
+import { defaults, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from './core.mjs';
 
 const KEY = 'impersonate_swap';
 let active = null;
 let transaction = null;
+let requestTransaction = null;
+let requestConfig = null;
 const wrappedManagers = new WeakSet();
 
 function settings() {
@@ -19,6 +21,73 @@ function restore() {
     transaction?.restore();
     transaction = null;
     active = null;
+}
+
+function restoreRequest() {
+    requestTransaction?.restore();
+    requestTransaction = null;
+    requestConfig = null;
+}
+
+function cleanup() {
+    restore();
+    restoreRequest();
+}
+
+function prepareRequestSettings(config) {
+    requestTransaction = new PromptTransaction();
+    const limit = config.responseTokensEnabled ? validResponseTokens(config.responseTokens) : null;
+    requestConfig = { limit, api: main_api };
+    if (limit !== null) {
+        if (main_api === 'openai') {
+            // Keep this override through CHAT_COMPLETION_SETTINGS_READY: prompt-ready is too early.
+            requestTransaction.patch(oai_settings, { openai_max_tokens: limit });
+        } else {
+            // amount_gen is a read-only ES module binding. Reserve extra response space while
+            // building the prompt, then override the request aliases without touching the sliders.
+            const extra = Math.max(0, limit - getMaxResponseTokens());
+            requestTransaction.patch(power_user, { token_padding: Number(power_user.token_padding || 0) + extra });
+        }
+    }
+    if (config.stoppingStringsEnabled) {
+        let additions;
+        try {
+            additions = parseStoppingStrings(config.stoppingStrings);
+        } catch (error) {
+            console.warn('[Impersonate Swap] Invalid stopping strings; additions skipped', error);
+            return;
+        }
+        if (!additions.length) return;
+        let existing = [];
+        try {
+            const parsed = JSON.parse(power_user.custom_stopping_strings || '[]');
+            if (Array.isArray(parsed)) existing = parsed.filter(value => typeof value === 'string' && value.length > 0);
+        } catch { /* ST also treats invalid global JSON as an empty list. */ }
+        requestTransaction.patch(power_user, {
+            custom_stopping_strings: JSON.stringify([...new Set([...existing, ...additions])]),
+        });
+    }
+}
+
+function finishGenerationData(data, dryRun) {
+    try {
+        if (!dryRun && requestConfig && requestConfig.api !== 'openai') {
+            overrideResponseTokens(data, requestConfig.limit);
+        }
+    } finally {
+        restore();
+        // CC has only assembled messages here; its actual request parameters are built later.
+        if (requestConfig?.api !== 'openai') restoreRequest();
+    }
+}
+
+function finishChatSettings(data) {
+    if (!requestConfig || requestConfig.api !== 'openai' || data.type !== 'impersonate') return;
+    try {
+        overrideResponseTokens(data, requestConfig.limit);
+    } finally {
+        restoreRequest();
+    }
 }
 
 function wrapPromptManager() {
@@ -80,13 +149,14 @@ function swapLoreSources(sources) {
 }
 
 function start(type, _options, dryRun) {
-    restore();
+    cleanup();
     const config = settings();
     // ST skips history interceptors for token-count dry runs. Never apply half a swap.
     if (type !== 'impersonate' || dryRun || !config.enabled) return;
     active = config;
     transaction = new PromptTransaction();
     try {
+        prepareRequestSettings(config);
         wrapPromptManager();
         swapAdditionalSources(config);
         active.endContextText = config.endContextEnabled ? substituteParams(config.endContextPrompt).trim() : '';
@@ -117,7 +187,7 @@ function start(type, _options, dryRun) {
             transaction.patch(instruct, { last_input_sequence: instruct.last_output_sequence || instruct.output_sequence || ' ' });
         }
     } catch (error) {
-        restore();
+        cleanup();
         console.error('[Impersonate Swap] Failed to prepare prompt', error);
         throw error;
     }
@@ -156,18 +226,19 @@ globalThis.impersonateSwapInterceptor = (chat, _contextSize, _abort, type) => {
 };
 
 // Restore before every new generation, including aborted slash commands and dry runs.
-eventSource.makeFirst(event_types.GENERATION_STARTED, restore);
+eventSource.makeFirst(event_types.GENERATION_STARTED, cleanup);
 eventSource.on(event_types.GENERATION_AFTER_COMMANDS, start);
 eventSource.on(event_types.WORLDINFO_ENTRIES_LOADED, swapLoreSources);
 // Text Completion has finished formatting/tokenizing; CC has finished preparing all prompts.
-eventSource.makeLast(event_types.GENERATE_AFTER_DATA, restore);
+eventSource.makeLast(event_types.GENERATE_AFTER_DATA, finishGenerationData);
+eventSource.makeLast(event_types.CHAT_COMPLETION_SETTINGS_READY, finishChatSettings);
 eventSource.makeLast(event_types.CHAT_COMPLETION_PROMPT_READY, finishChatPrompt);
 eventSource.makeLast(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, finishTextPrompt);
-eventSource.on(event_types.GENERATION_ENDED, restore);
-eventSource.on(event_types.GENERATION_STOPPED, restore);
-eventSource.on(event_types.CHAT_CHANGED, restore);
-window.addEventListener('unhandledrejection', restore);
-window.addEventListener('error', restore);
+eventSource.on(event_types.GENERATION_ENDED, cleanup);
+eventSource.on(event_types.GENERATION_STOPPED, cleanup);
+eventSource.on(event_types.CHAT_CHANGED, cleanup);
+window.addEventListener('unhandledrejection', cleanup);
+window.addEventListener('error', cleanup);
 
 jQuery(() => {
     const panel = document.createElement('div');
@@ -247,6 +318,59 @@ jQuery(() => {
             saveSettingsDebounced();
         });
         section.append(label, textarea, description);
+        panel.querySelector('.inline-drawer-content').append(section);
+        refresh();
+    }
+    for (const [enabledKey, valueKey, title, numeric, hint] of [
+        ['responseTokensEnabled', 'responseTokens', 'Response (tokens)', true, 'Максимум выходных токенов для Impersonate; целое число больше нуля.'],
+        ['stoppingStringsEnabled', 'stoppingStrings', 'Additional stopping strings', false, 'По одной строке или JSON-массив строк. Добавляются к существующим; ограничения API сохраняются.'],
+    ]) {
+        const section = document.createElement('div');
+        section.className = 'impersonate-swap-request-setting m-t-1';
+        const label = document.createElement('label');
+        label.className = 'checkbox_label';
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox';
+        toggle.checked = settings()[enabledKey];
+        label.append(toggle, document.createTextNode(title));
+        const input = document.createElement(numeric ? 'input' : 'textarea');
+        input.className = 'text_pole';
+        if (numeric) {
+            input.type = 'number';
+            input.min = '1';
+            input.step = '1';
+        } else {
+            input.rows = 4;
+            input.placeholder = 'STOP\n<|end|>';
+        }
+        input.value = settings()[valueKey];
+        input.setAttribute('aria-label', title);
+        const description = document.createElement('small');
+        const refresh = () => {
+            const enabled = settings().enabled && toggle.checked;
+            input.disabled = !enabled;
+            input.style.opacity = description.style.opacity = enabled ? '1' : '0.45';
+            let error = '';
+            if (numeric && !validResponseTokens(input.value)) error = 'Введите целое число больше нуля; неверное значение не применяется.';
+            if (!numeric) {
+                try { parseStoppingStrings(input.value); }
+                catch { error = 'Некорректный JSON: нужен массив строк. Дополнительные стоп-строки не будут применены.'; }
+            }
+            description.textContent = error || hint;
+            input.setCustomValidity?.(error);
+        };
+        refreshPromptEditors.push(refresh);
+        toggle.addEventListener('change', () => {
+            extension_settings[KEY] = { ...settings(), [enabledKey]: toggle.checked };
+            saveSettingsDebounced();
+            refresh();
+        });
+        input.addEventListener('input', () => {
+            extension_settings[KEY] = { ...settings(), [valueKey]: input.value };
+            saveSettingsDebounced();
+            refresh();
+        });
+        section.append(label, input, description);
         panel.querySelector('.inline-drawer-content').append(section);
         refresh();
     }

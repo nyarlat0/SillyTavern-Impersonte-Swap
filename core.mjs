@@ -1,6 +1,29 @@
 export const defaults = Object.freeze({ enabled: true, history: true, system: true, context: true, contextDescriptions: true,
     character: false, persona: false, scenario: false, lore: false, authorsNote: false,
-    endContextEnabled: false, endContextPrompt: '', systemOverwriteEnabled: false, systemOverwritePrompt: '' });
+    endContextEnabled: false, endContextPrompt: '', systemOverwriteEnabled: false, systemOverwritePrompt: '',
+    responseTokensEnabled: false, responseTokens: 256, stoppingStringsEnabled: false, stoppingStrings: '' });
+
+export function validResponseTokens(value) {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+export function parseStoppingStrings(value) {
+    const text = String(value ?? '');
+    const values = text.trimStart().startsWith('[') ? JSON.parse(text) : text.split(/\r?\n/);
+    if (!Array.isArray(values) || values.some(item => typeof item !== 'string')) {
+        throw new Error('Stopping strings: ожидаются строки или JSON-массив строк.');
+    }
+    return [...new Set(values.filter(item => item.length > 0))];
+}
+
+export function overrideResponseTokens(data, limit) {
+    if (!validResponseTokens(limit)) return;
+    // All aliases in the outgoing request must agree, including llama.cpp/Ollama.
+    for (const key of ['max_tokens', 'max_completion_tokens', 'max_new_tokens', 'max_length', 'n_predict', 'num_predict']) {
+        if (Object.hasOwn(data, key)) data[key] = Number(limit);
+    }
+}
 
 export function joinPromptText(before, after) {
     return before ? `${before}\n\n${after}` : after;

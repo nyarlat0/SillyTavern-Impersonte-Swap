@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
-import { defaults, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from '../core.mjs';
+import { defaults, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction } from '../core.mjs';
 
 test('swap only the two exact macros in one pass', () => {
     assert.equal(swapMacros('{{char}} {{USER}} {{ user }} {{persona}} Alice char {{character}}'),
@@ -53,8 +53,9 @@ async function fixture(api = 'openai', document = undefined) {
         makeLast(key, fn) { this.on(key, fn); },
     };
     const event_types = Object.fromEntries(['GENERATION_STARTED', 'GENERATION_AFTER_COMMANDS', 'GENERATE_AFTER_DATA',
-        'CHAT_COMPLETION_PROMPT_READY', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED', 'WORLDINFO_ENTRIES_LOADED', 'GENERATE_BEFORE_COMBINE_PROMPTS'].map(x => [x, x]));
+        'CHAT_COMPLETION_PROMPT_READY', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'CHAT_CHANGED', 'WORLDINFO_ENTRIES_LOADED', 'GENERATE_BEFORE_COMBINE_PROMPTS', 'CHAT_COMPLETION_SETTINGS_READY'].map(x => [x, x]));
     const power_user = {
+        token_padding: 64, custom_stopping_strings: '["existing"]',
         sysprompt: { content: 'You are {{char}}, talk to {{user}}', post_history: '{{char}}' },
         context: { story_string: '{{char}}: {{description}} {{user}}: {{persona}}', chat_start: '{{char}}', example_separator: '###' },
         instruct: { enabled: true, input_sequence: '<user>', output_sequence: '<assistant>', last_input_sequence: '<last-user>' },
@@ -64,11 +65,12 @@ async function fixture(api = 'openai', document = undefined) {
     const extension_settings = {};
     const extension_prompts = {};
     const groups = [];
+    const oai_settings = { openai_max_tokens: 300 };
     const promptManager = { preparePrompt: prompt => ({ ...prompt }) };
     const ready = [];
     const context = vm.createContext({ console, document, window: { addEventListener() {} }, jQuery(callback) { ready.push(callback); } });
     const dependencies = {
-        '../../../../script.js': { eventSource, event_types, characters, chat_metadata, extension_prompts, this_chid: 0, main_api: api, name1: 'Alice', name2: 'Bob',
+        '../../../../script.js': { eventSource, event_types, characters, chat_metadata, extension_prompts, this_chid: 0, main_api: api, getMaxResponseTokens: () => 80, name1: 'Alice', name2: 'Bob',
             substituteParams: text => text.replaceAll('{{user}}', 'Alice').replaceAll('{{char}}', 'Bob'), saveSettingsDebounced() {} },
         '../../../extensions.js': { extension_settings },
         '../../../power-user.js': { power_user },
@@ -80,8 +82,8 @@ async function fixture(api = 'openai', document = undefined) {
                 return `<${role}>\n${text}</${role}>\n`;
             },
         },
-        '../../../openai.js': { promptManager },
-        './core.mjs': { defaults, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction },
+        '../../../openai.js': { promptManager, oai_settings },
+        './core.mjs': { defaults, validResponseTokens, parseStoppingStrings, overrideResponseTokens, appendSystemMessage, appendTextSystemMessage, swapMacros, swapContextDescriptions, swapHistory, PromptTransaction },
     };
     const module = new vm.SourceTextModule(await readFile(new URL('../index.js', import.meta.url), 'utf8'), { context });
     await module.link(specifier => {
@@ -96,7 +98,7 @@ async function fixture(api = 'openai', document = undefined) {
         await emit('GENERATION_STARTED', type, {}, dry);
         await emit('GENERATION_AFTER_COMMANDS', type, {}, dry);
     };
-    return { power_user, characters, chat_metadata, extension_prompts, groups, extension_settings, promptManager, context, emit, start, render: () => ready.forEach(callback => callback()) };
+    return { power_user, characters, chat_metadata, extension_prompts, groups, extension_settings, promptManager, oai_settings, context, emit, start, render: () => ready.forEach(callback => callback()) };
 }
 
 test('Chat Completion changes main prompt and history, excludes other prompt blocks, cleans up', async () => {
@@ -496,7 +498,7 @@ test('prompt editors retain saved text and dim/disable with their own switch or 
     f.extension_settings.impersonate_swap = { systemOverwritePrompt: 'Saved overwrite', endContextPrompt: 'Saved end' };
     f.render();
     const panel = root.children[0];
-    const sections = panel.querySelector('.inline-drawer-content').children;
+    const sections = panel.querySelector('.inline-drawer-content').children.filter(section => section.className.startsWith('impersonate-swap-prompt '));
     assert.equal(sections.length, 2);
     for (const section of sections) {
         const [label, textarea] = section.children;
@@ -606,4 +608,96 @@ test('generation hook merges system frames with wrap disabled and no injected me
     await f.emit('GENERATE_BEFORE_COMBINE_PROMPTS', data);
     assert.equal(data.finalMesSend.map(item => item.message).join(''), '<system>\nNote A\n\nNote B\n\nEnd</system>\n\n<assistant>');
     await f.emit('GENERATE_AFTER_DATA');
+});
+
+test('response limit validates positive integers and updates every existing output-length alias', () => {
+    for (const value of ['', ' ', 'bad', 0, -1, 1.5, Infinity, null]) assert.equal(validResponseTokens(value), null);
+    assert.equal(validResponseTokens('512'), 512);
+    const data = { max_tokens: 80, max_new_tokens: 80, n_predict: 80, num_predict: 80, max_context_length: 4096 };
+    overrideResponseTokens(data, 512);
+    assert.deepEqual(data, { max_tokens: 512, max_new_tokens: 512, n_predict: 512, num_predict: 512, max_context_length: 4096 });
+    assert.equal(Object.hasOwn(data, 'max_completion_tokens'), false);
+    const reasoning = { max_completion_tokens: 80 };
+    overrideResponseTokens(reasoning, 1000);
+    assert.deepEqual(reasoning, { max_completion_tokens: 1000 });
+});
+
+test('stopping strings preserve significant whitespace and support JSON escapes without duplicates', () => {
+    assert.deepEqual(parseStoppingStrings('STOP\r\n role: \r\nSTOP\r\n'), ['STOP', ' role: ']);
+    assert.deepEqual(parseStoppingStrings('["\\nUser:", "STOP", "STOP", ""]'), ['\nUser:', 'STOP']);
+    assert.deepEqual(parseStoppingStrings(''), []);
+    assert.throws(() => parseStoppingStrings('["unfinished"'));
+    assert.throws(() => parseStoppingStrings('[1, "STOP"]'));
+});
+
+test('CC parameters remain overridden until request construction, then restore without persisting', async () => {
+    const f = await fixture();
+    f.extension_settings.impersonate_swap = {
+        responseTokensEnabled: true, responseTokens: 1024,
+        stoppingStringsEnabled: true, stoppingStrings: 'existing\nNEW',
+    };
+    const oldPower = JSON.stringify(f.power_user);
+    const oldOai = JSON.stringify(f.oai_settings);
+    await f.start();
+    assert.equal(f.oai_settings.openai_max_tokens, 1024);
+    assert.deepEqual(JSON.parse(f.power_user.custom_stopping_strings), ['existing', 'NEW']);
+    assert.equal(JSON.stringify(f.power_user), oldPower);
+    assert.equal(JSON.stringify(f.oai_settings), oldOai);
+    await f.emit('CHAT_COMPLETION_PROMPT_READY', { chat: [] });
+    await f.emit('GENERATE_AFTER_DATA', { prompt: [] });
+    assert.equal(f.oai_settings.openai_max_tokens, 1024);
+    assert.deepEqual(JSON.parse(f.power_user.custom_stopping_strings), ['existing', 'NEW']);
+    const data = { type: 'impersonate', max_completion_tokens: f.oai_settings.openai_max_tokens, stop: JSON.parse(f.power_user.custom_stopping_strings) };
+    await f.emit('CHAT_COMPLETION_SETTINGS_READY', data);
+    assert.equal(data.max_completion_tokens, 1024);
+    assert.deepEqual(data.stop, ['existing', 'NEW']);
+    assert.equal(Object.hasOwn(data, 'max_tokens'), false);
+    assert.equal(f.oai_settings.openai_max_tokens, 300);
+    assert.equal(f.power_user.custom_stopping_strings, '["existing"]');
+    assert.equal(JSON.stringify(f.power_user), oldPower);
+});
+
+test('TC reserves additional response space and overrides output aliases only for the impersonation request', async () => {
+    for (const api of ['textgenerationwebui', 'kobold', 'novel', 'koboldhorde']) {
+        const f = await fixture(api);
+        f.extension_settings.impersonate_swap = {
+            responseTokensEnabled: true, responseTokens: 512,
+            stoppingStringsEnabled: true, stoppingStrings: '["\\nStop:"]',
+        };
+        await f.start();
+        assert.equal(f.power_user.token_padding, 64 + 512 - 80);
+        assert.deepEqual(JSON.parse(f.power_user.custom_stopping_strings), ['existing', '\nStop:']);
+        const data = api === 'textgenerationwebui'
+            ? { max_new_tokens: 80, max_tokens: 80, n_predict: 80, num_predict: 80, stopping_strings: ['native', 'existing', '\nStop:'] }
+            : { max_length: 80, stop_sequence: ['native', 'existing', '\nStop:'] };
+        await f.emit('GENERATE_AFTER_DATA', data);
+        for (const key of Object.keys(data).filter(key => /tokens|predict|max_length/.test(key))) assert.equal(data[key], 512);
+        assert.equal(f.power_user.token_padding, 64);
+        assert.equal(f.power_user.custom_stopping_strings, '["existing"]');
+        await f.start('normal');
+        const normal = { max_length: 80 };
+        await f.emit('GENERATE_AFTER_DATA', normal);
+        assert.equal(normal.max_length, 80);
+    }
+});
+
+test('new request settings honor switches, dry runs, cancellation, and native unsupported-stop behavior', async () => {
+    for (const event of ['GENERATION_STOPPED', 'GENERATION_ENDED', 'CHAT_CHANGED', 'GENERATION_STARTED']) {
+        const f = await fixture();
+        f.extension_settings.impersonate_swap = { responseTokensEnabled: true, responseTokens: 1000, stoppingStringsEnabled: true, stoppingStrings: 'STOP' };
+        await f.start('impersonate', true);
+        assert.equal(f.oai_settings.openai_max_tokens, 300);
+        assert.equal(f.power_user.custom_stopping_strings, '["existing"]');
+        await f.start();
+        await f.emit(event);
+        assert.equal(f.oai_settings.openai_max_tokens, 300);
+        assert.equal(f.power_user.custom_stopping_strings, '["existing"]');
+    }
+    const f = await fixture();
+    f.extension_settings.impersonate_swap = { stoppingStringsEnabled: true, stoppingStrings: 'STOP' };
+    await f.start();
+    const native = { type: 'impersonate', max_completion_tokens: 300 }; // Native ST removed stop for this model.
+    await f.emit('CHAT_COMPLETION_SETTINGS_READY', native);
+    assert.equal(Object.hasOwn(native, 'stop'), false);
+    assert.equal(native.max_completion_tokens, 300);
 });

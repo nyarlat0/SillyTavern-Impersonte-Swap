@@ -111,6 +111,35 @@ These fields are written specifically for impersonation. Standard SillyTavern ma
 
 The end-context prompt is inserted after SillyTavern selects history to fit its token budget. Leave space in the context budget for this text, especially for long instructions; the extension does not retrim history after appending it.
 
+## Impersonation generation settings
+
+Both settings have independent enable switches, default to **Off**, and use dimmed, disabled editors when off. Their values are saved with the extension; your normal generation settings are restored after the impersonation request is built or cancelled.
+
+### Response (tokens)
+
+Overrides the maximum number of output tokens (`genamt` / Response tokens) for Impersonate. Enter a positive integer; the inactive default value is **256**. Empty, fractional, zero, and negative values are not applied. This is a maximum, not a target reply length.
+
+Chat Completion uses the override both when budgeting context and building the request, including models with `max_completion_tokens`. Text Completion updates the output-length parameters in the outgoing request without moving the global Response slider. If the new limit is larger than the global one, extra token padding reserves the additional response space; a smaller limit keeps the existing, conservative history budget. The requested value must fit your model/provider's limits.
+
+### Additional stopping strings
+
+Adds stopping strings to the ones already configured in SillyTavern. Enter one per line:
+
+```text
+<|end|>
+STOP
+```
+
+Or use a JSON array for escaped newlines and other special characters:
+
+```json
+["\nUser:", "\n{{char}}:", "<|end|>"]
+```
+
+Existing custom strings come first; duplicates are removed. Empty entries are ignored, while spaces inside a string are preserved. Invalid JSON is shown below the editor and the additions are skipped until corrected. Macro expansion follows SillyTavern's **Custom Stopping Strings → Replace macros** setting; no automatic name swap is applied.
+
+The extension uses SillyTavern's native stopping-string path, preserving generated name/Instruct stops and the backend's conversion (including tokenized NovelAI stops). Model/provider limits still apply: if existing strings fill the supported slots, some additions may not be sent. A model for which SillyTavern disables stop strings does not gain support through this setting.
+
 ## Compatibility and limitations
 
 - **Chat Completion:** swaps API roles and suppresses SillyTavern's standard Impersonate instruction when history swapping is enabled.
